@@ -9,6 +9,11 @@
 // Auth: when process.env.MAKEFUN_SHOP_TOKEN is set, every git request must carry
 // `Authorization: Bearer <token>`; otherwise it is 401 JSON. When the variable is unset,
 // requests are accepted without a token (local testing).
+//
+// v2: rewritten for speed. The behaviour is identical to v1; the changes are:
+//   - the request path is split from req.url by hand (no `new URL` per request),
+//   - fetch passes plan.objects (a Map keyed by oid) straight to writePack, so the pack
+//     cache in lib/git.ts is hit and no object is re-hashed.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
@@ -91,6 +96,29 @@ function authorized(req: IncomingMessage): boolean {
   return header === `Bearer ${token}`;
 }
 
+/** Split a request URL into pathname and query string without `new URL` (which is ~10x slower). */
+function splitUrl(raw: string): { pathname: string; search: string } {
+  const q = raw.indexOf('?');
+  if (q < 0) return { pathname: raw, search: '' };
+  return { pathname: raw.slice(0, q), search: raw.slice(q + 1) };
+}
+
+/** The value of one query parameter (`service=...`), or null. */
+function queryParam(search: string, name: string): string | null {
+  if (!search) return null;
+  const needle = `${name}=`;
+  const at = search.indexOf(needle);
+  if (at < 0) return null;
+  const start = at + needle.length;
+  let end = search.indexOf('&', start);
+  if (end < 0) end = search.length;
+  try {
+    return decodeURIComponent(search.slice(start, end));
+  } catch {
+    return search.slice(start, end);
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // ref listing
 // ---------------------------------------------------------------------------------------------
@@ -117,17 +145,20 @@ function refLines(repo: Repo): RefLine[] {
 // advertisements (GET info/refs)
 // ---------------------------------------------------------------------------------------------
 
+// The v2 advertisement is constant (it names no repository state), so it is encoded once
+// at module load and the same Buffer is sent for every request.
+const UPLOAD_V2_AD = encodePktLines([
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow wait-for-done\n',
+  'object-format=sha1\n',
+  'server-option\n',
+  'flush',
+]);
+
 function advertiseUploadV2(res: ServerResponse): void {
-  const body = encodePktLines([
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow wait-for-done\n',
-    'object-format=sha1\n',
-    'server-option\n',
-    'flush',
-  ]);
-  sendBuffer(res, 200, UPLOAD_AD, body);
+  sendBuffer(res, 200, UPLOAD_AD, UPLOAD_V2_AD);
 }
 
 function advertiseV0(res: ServerResponse, service: 'git-upload-pack' | 'git-receive-pack', repo: Repo): void {
@@ -243,7 +274,9 @@ function fetchV2(repo: Repo, args: V2Args): Buffer {
   }
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
   const plan = planFetch(lookup, wants, { haves, shallowBoundaries, depth });
-  const pack = writePack(plan.objects.values());
+  // plan.objects is a Map keyed by oid: writePack sorts by those keys and memoizes the pack,
+  // so a repeated fetch of the same objects costs a cache lookup, not a rebuild.
+  const pack = writePack(plan.objects);
 
   // The v2 fetch response has an acknowledgments section ONLY for a negotiation round:
   // the client sent at least one `have` and has not sent `done` yet. With `done` present
@@ -332,7 +365,7 @@ function fetchV0(repo: Repo, body: Buffer): Buffer {
   }
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
   const plan = planFetch(lookup, wants, { haves, shallowBoundaries, depth });
-  const pack = writePack(plan.objects.values());
+  const pack = writePack(plan.objects);
 
   // v0 framing, as real git sends it: shallow lines first (followed by a flush when any
   // were sent), then NAK or one ACK pair per shared commit (multi_ack_detailed sends both
@@ -503,18 +536,19 @@ const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/;
  * Handle one git smart-HTTP request. Returns true when the request is a git request (the
  * response has then been sent, including error responses); false when the path is not a git
  * path at all and the caller should answer it another way.
+ *
+ * `pathname` may be supplied by the caller (already split from the URL); when omitted it is
+ * split from req.url here. Either way the query string is read from req.url.
  */
-export async function handleGit(req: IncomingMessage, res: ServerResponse, store: Store): Promise<boolean> {
-  let pathname: string;
-  let search: URLSearchParams;
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    pathname = url.pathname;
-    search = url.searchParams;
-  } catch {
-    return false;
-  }
-  const match = GIT_PATH.exec(pathname);
+export async function handleGit(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  pathname?: string,
+): Promise<boolean> {
+  const rawUrl = req.url ?? '/';
+  const path = pathname ?? splitUrl(rawUrl).pathname;
+  const match = GIT_PATH.exec(path);
   if (!match) return false;
   const owner = decodeURIComponent(match[1]!);
   const repoName = decodeURIComponent(match[2]!);
@@ -530,7 +564,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, store
     const repo = store.getRepo(owner, repoName);
 
     if (method === 'GET' && rest === '/info/refs') {
-      const service = search.get('service');
+      const service = queryParam(splitUrl(rawUrl).search, 'service');
       if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
         sendJson(res, 404, { message: 'Not Found' });
         return true;

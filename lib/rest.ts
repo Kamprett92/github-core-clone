@@ -53,9 +53,14 @@ function sendError(res: ServerResponse, status: number, message: string): void {
 type JsonObject = Record<string, unknown>;
 
 async function readBody(req: IncomingMessage): Promise<{ ok: true; body: JsonObject } | { ok: false }> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
-  const text = Buffer.concat(chunks).toString('utf8').trim();
+  // Event-based read (not `for await`): the async iterator's per-chunk setup is measurable
+  // across thousands of small bodies.
+  const text = await new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string)));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8').trim()));
+    req.on('error', reject);
+  });
   if (text === '') return { ok: true, body: {} };
   let parsed: unknown;
   try {
@@ -143,6 +148,8 @@ function pullObject(pr: Pull): Record<string, unknown> {
 // ---------------------------------------------------------------------------------------------
 
 function decodeSegment(segment: string): string {
+  // Most segments carry no escapes; decodeURIComponent on a plain string is pure overhead.
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -166,22 +173,30 @@ function parseIssueNumber(raw: string): number | null {
 // handler
 // ---------------------------------------------------------------------------------------------
 
-export async function handleRest(req: IncomingMessage, res: ServerResponse, store: Store): Promise<boolean> {
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    return false;
-  }
-  const pathname = url.pathname;
+export async function handleRest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+  pathname?: string,
+): Promise<boolean> {
+  // `pathname` may be supplied by the caller (already split from the URL); when omitted
+  // it is parsed here. The query string is read with URLSearchParams (cheaper than a
+  // full `new URL`): REST routes need per_page/page/state/sort/direction/sha/ref.
+  const rawUrl = req.url ?? '/';
+  const path = pathname ?? (() => {
+    const q = rawUrl.indexOf('?');
+    return q < 0 ? rawUrl : rawUrl.slice(0, q);
+  })();
+  const qAt = rawUrl.indexOf('?');
+  const searchParams = new URLSearchParams(qAt < 0 ? '' : rawUrl.slice(qAt + 1));
   const method = req.method ?? 'GET';
 
   // Only /api/v3 paths are ours at all.
-  if (pathname !== '/api/v3' && !pathname.startsWith('/api/v3/')) return false;
+  if (path !== '/api/v3' && !path.startsWith('/api/v3/')) return false;
   // The starter already handles the API root (and /healthz is not under /api/v3).
-  if (pathname === '/api/v3' || pathname === '/api/v3/') return false;
+  if (path === '/api/v3' || path === '/api/v3/') return false;
 
-  const segments = pathname
+  const segments = path
     .slice('/api/v3/'.length)
     .split('/')
     .filter((segment) => segment !== '')
@@ -241,8 +256,8 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
       route = {
         auth: true,
         run: async () => {
-          const perPage = Math.min(parsePositiveInt(url.searchParams.get('per_page'), 30), 100);
-          const page = parsePositiveInt(url.searchParams.get('page'), 1);
+          const perPage = Math.min(parsePositiveInt(searchParams.get('per_page'), 30), 100);
+          const page = parsePositiveInt(searchParams.get('page'), 1);
           const all = store.listReposByOwner(VIEWER_LOGIN);
           const totalPages = Math.max(1, Math.ceil(all.length / perPage));
           const start = (page - 1) * perPage;
@@ -350,7 +365,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
         run: async () => {
           const repo = requireOwnedRepo(owner, repoName);
           if (!repo) return;
-          const sha = url.searchParams.get('sha') ?? undefined;
+          const sha = searchParams.get('sha') ?? undefined;
           const commits = store.listCommits(repo, sha);
           sendJson(
             res,
@@ -405,7 +420,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           run: async () => {
             const repo = requireOwnedRepo(owner, repoName);
             if (!repo) return;
-            const ref = url.searchParams.get('ref') ?? undefined;
+            const ref = searchParams.get('ref') ?? undefined;
             const found = store.getContent(repo, contentPath, ref);
             if (!found) {
               sendError(res, 404, 'Not Found');
@@ -526,12 +541,12 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           run: async () => {
             const repo = requireOwnedRepo(owner, repoName);
             if (!repo) return;
-            const stateParam = url.searchParams.get('state') ?? 'open';
+            const stateParam = searchParams.get('state') ?? 'open';
             const state: 'open' | 'closed' | 'all' =
               stateParam === 'closed' || stateParam === 'all' ? stateParam : 'open';
             let issues = store.listIssues(repo, state);
-            if (url.searchParams.get('sort') === 'created') {
-              const direction = url.searchParams.get('direction') ?? 'desc';
+            if (searchParams.get('sort') === 'created') {
+              const direction = searchParams.get('direction') ?? 'desc';
               issues = [...issues].sort((a, b) =>
                 direction === 'asc' ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq,
               );
@@ -649,7 +664,7 @@ export async function handleRest(req: IncomingMessage, res: ServerResponse, stor
           run: async () => {
             const repo = requireOwnedRepo(owner, repoName);
             if (!repo) return;
-            const stateParam = url.searchParams.get('state') ?? 'open';
+            const stateParam = searchParams.get('state') ?? 'open';
             const state: 'open' | 'closed' | 'all' =
               stateParam === 'closed' || stateParam === 'all' ? stateParam : 'open';
             sendJson(res, 200, store.listPulls(repo, state).map(pullObject));

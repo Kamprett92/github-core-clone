@@ -189,17 +189,22 @@ export class Store {
   private readonly repos = new Map<string, Repo>();
   private repoIdSeq = 1;
   private seq = 0;
+  /** Cached nowIso(): the value never changes within a process (FIXED_NOW or the env var). */
+  private cachedNowIso: string | null = null;
 
   // -- time -------------------------------------------------------------------------------
 
   /** The fixed "now": MAKEFUN_TRIAL_NOW when set and valid, else FIXED_NOW. Never wall-clock. */
   nowIso(): string {
+    if (this.cachedNowIso !== null) return this.cachedNowIso;
     const env = process.env.MAKEFUN_TRIAL_NOW;
+    let value = FIXED_NOW;
     if (env) {
       const parsed = Date.parse(env);
-      if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+      if (Number.isFinite(parsed)) value = new Date(parsed).toISOString();
     }
-    return FIXED_NOW;
+    this.cachedNowIso = value;
+    return value;
   }
 
   /** Unix seconds matching nowIso(), for commit author/committer lines. */
