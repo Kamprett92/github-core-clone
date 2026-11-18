@@ -62,8 +62,6 @@ export function createApp(): Server {
   const store = new Store();
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
-      // Parse the URL once here; the handlers take the pathname instead of parsing it
-      // again (a `new URL` per handler is measurable across thousands of requests).
       const path = pathOf(req);
       const method = req.method ?? 'GET';
 
@@ -85,8 +83,8 @@ export function createApp(): Server {
       // 404, so the fallback below only sees paths outside every surface.
       if (await handleGraphql(req, res, store)) return;
       if (await handleMcp(req, res, store)) return;
-      if (await handleGit(req, res, store, path)) return;
-      if (await handleRest(req, res, store, path)) return;
+      if (await handleGit(req, res, store)) return;
+      if (await handleRest(req, res, store)) return;
 
       sendJson(res, 404, { message: 'Not Found' });
     })().catch(() => {
