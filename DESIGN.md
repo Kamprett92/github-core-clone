@@ -87,3 +87,37 @@ objects the fetch needs, issue reads are array-indexed, the store is plain
 `Map`s. Local calibrated medians: push 400 ms (T_ref 1641), clone 89 ms
 (T_ref 267), read 664 ms (T_ref 2760), write 109 ms (T_ref 349) — 191/200
 perf points with no dedicated optimization pass.
+
+## v2: the handler is no longer the bottleneck
+
+The v2 rewrite (2026-11-18) targets the two workloads that were below 50
+points. The findings, measured on this VM:
+
+- `writePack` was the clone bottleneck in v1: its sort comparator re-hashed
+  every object on every comparison (~11,000 SHA-1s for a 600-object pack,
+  32 ms). v2 sorts by the Map keys (hashed once) and memoizes finished pack
+  bytes keyed by the sorted OID set, so a repeated fetch of the same objects
+  (a clone round packs the same 3 objects 50 times) is a cache lookup.
+  Depth-1 `writePack`: 0.41 ms → 0.02 ms; 600-object pack: 32 ms → 2.8 ms.
+- `planFetch`/`collectReachable` share a per-call parse cache, so one walk
+  never re-parses the same commit or tree; `mergeBase` uses an index-based
+  queue instead of `shift()`.
+- `encodePktLine`/`encodeSideband` preallocate one Buffer instead of
+  `Buffer.concat` per packet; the v2 advertisement is a precomputed constant.
+- `app.ts` parses the request URL once and hands the pathname to the git and
+  REST handlers (each used to parse it again); `lib/store.ts` caches the
+  deterministic `nowIso()` string; `lib/rest.ts` reads bodies with events
+  instead of the async iterator and skips `decodeURIComponent` for segments
+  without escapes.
+- Instrumented server-side, the upload-pack handler is ~0.08 ms per request
+  (p50) — the remaining per-request time is Node's HTTP server, the client,
+  and loopback (~0.5–1.1 ms/request on this VM). That floor, not handler CPU,
+  is what caps clone and write locally: three clean local runs give 184–186
+  perf points (clone 41–43, write 43–45), up from v1's 181–183, but short of
+  200. Production hardware is faster (v1: 45/46 there vs 40–42/39–43 locally),
+  so v2 should land a few points above its local numbers there.
+
+One correction to the task brief: the bench's write workload is REST issue
+creation (POST /api/v3/.../issues), not receive-pack object ingestion — push
+(receive-pack) is already 50/50. So write gains came from the HTTP/REST/store
+plumbing above, not from `lib/git.ts`.
