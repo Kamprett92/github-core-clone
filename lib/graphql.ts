@@ -1,120 +1,58 @@
-// lib/graphql.ts — GitHub GraphQL v4 surface (POST /api/graphql) over the shared store.
+// lib/graphql.ts — the GraphQL v4 surface (POST /api/graphql).
 //
-// Targeted executor: a small tokenizer + parser for the GraphQL documents the
-// suite sends (operations, variables, arguments, inline/named fragments,
-// @skip/@include), with per-type field validation. Unknown fields are
-// GraphQL-level errors (HTTP 200, `errors` array); unknown repositories are
-// `data.repository = null` with NO errors. No wall-clock time, no randomness.
+// A targeted executor, not a general engine: a small tokenizer and
+// recursive-descent parser for the documents `gh` and `github-mcp-server`
+// send, a validator against a static schema table, and resolvers over the
+// shared store. It also answers generic `__type` introspection for the
+// probed names, and GitHub-style operation batching (a JSON array of
+// operation documents in one body answers an array, in order).
 //
-// Auth mirrors the git/REST surfaces: when process.env.MAKEFUN_SHOP_TOKEN is
-// set, `Authorization: Bearer <token>` is required (missing/wrong → 401 JSON);
-// when it is unset, requests are allowed.
+// Wire rules, derived from the suite's documents:
+//   - an unauthenticated request is exactly 401;
+//   - an unknown field is HTTP 200 with an `errors` array naming it;
+//   - an unknown repository is `data.repository = null` with no errors;
+//   - issue / pull-request connections default to OPEN only;
+//   - global ids are the store's own (`R_...` / `I_...` / `PR_...`),
+//     stable across reads and surfaces;
+//   - `issues` with orderBy {field: CREATED_AT, direction: DESC} returns
+//     issue numbers in descending order, ties by number DESC.
+//
+// Determinism: no clock, no randomness. Cursors are base64 of a stable
+// `cursor:<number>` string, so paging replays exactly.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { Store, VIEWER_LOGIN, isStoreError } from './store.ts';
-import type { Issue, Pull, Repo } from './store.ts';
+import { isAuthorized, nextRequestId } from './rest.ts';
+import {
+  isStoreError,
+  Store,
+  type Issue,
+  type Pull,
+  type Repo,
+} from './store.ts';
 
-// ---------------------------------------------------------------------------------------------
-// http helpers
-// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// tokenizer
+// ---------------------------------------------------------------------------
 
-const JSON_TYPE = 'application/json; charset=utf-8';
+type TokenKind = 'name' | 'int' | 'float' | 'string' | 'punct' | 'eof';
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+interface Token {
+  kind: TokenKind;
+  value: string;
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
-    req.on('error', reject);
-  });
-}
-
-function checkAuth(req: IncomingMessage): boolean {
-  const configured = process.env.MAKEFUN_SHOP_TOKEN;
-  if (!configured) return true;
-  return req.headers.authorization === `Bearer ${configured}`;
-}
-
-// ---------------------------------------------------------------------------------------------
-// GraphQL document parser (small targeted subset)
-// ---------------------------------------------------------------------------------------------
-
-type ValueNode =
-  | { kind: 'variable'; name: string }
-  | { kind: 'string'; value: string }
-  | { kind: 'int'; value: number }
-  | { kind: 'float'; value: number }
-  | { kind: 'boolean'; value: boolean }
-  | { kind: 'null' }
-  | { kind: 'enum'; value: string }
-  | { kind: 'list'; values: ValueNode[] }
-  | { kind: 'object'; fields: Array<{ name: string; value: ValueNode }> };
-
-interface DirectiveNode {
-  name: string;
-  args: Array<{ name: string; value: ValueNode }>;
-}
-
-interface FieldNode {
-  kind: 'field';
-  name: string;
-  alias: string | null;
-  args: Array<{ name: string; value: ValueNode }>;
-  directives: DirectiveNode[];
-  selections: SelectionNode[] | null;
-}
-
-type SelectionNode =
-  | FieldNode
-  | { kind: 'fragmentSpread'; name: string; directives: DirectiveNode[] }
-  | { kind: 'inlineFragment'; typeCondition: string | null; directives: DirectiveNode[]; selections: SelectionNode[] };
-
-interface VariableDef {
-  name: string;
-  type: string;
-  defaultValue: ValueNode | null;
-}
-
-interface OperationNode {
-  kind: 'operation';
-  operation: 'query' | 'mutation' | 'subscription';
-  name: string | null;
-  variables: VariableDef[];
-  selections: SelectionNode[];
-}
-
-interface FragmentNode {
-  kind: 'fragment';
-  name: string;
-  typeCondition: string;
-  selections: SelectionNode[];
-}
-
-type DefinitionNode = OperationNode | FragmentNode;
-
-class ParseError extends Error {}
-
-type Token =
-  | { kind: 'name'; value: string }
-  | { kind: 'int'; value: string }
-  | { kind: 'float'; value: string }
-  | { kind: 'string'; value: string }
-  | { kind: 'punct'; value: string }
-  | { kind: 'eof' };
+class LexError extends Error {}
 
 function tokenize(source: string): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   const len = source.length;
+  const isNameStart = (ch: string): boolean => /[A-Za-z_]/.test(ch);
+  const isNameChar = (ch: string): boolean => /[A-Za-z0-9_]/.test(ch);
+  const isDigit = (ch: string): boolean => /[0-9]/.test(ch);
   while (i < len) {
     const ch = source[i]!;
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === ',') {
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === ',' || ch === '﻿') {
       i += 1;
       continue;
     }
@@ -123,92 +61,164 @@ function tokenize(source: string): Token[] {
       continue;
     }
     if (ch === '"') {
-      // Block string """...""" or regular "...".
-      if (source.startsWith('"""', i)) {
+      // Block string """...""" or a plain "..." string.
+      if (source.slice(i, i + 3) === '"""') {
         const end = source.indexOf('"""', i + 3);
-        if (end === -1) throw new ParseError('Unterminated block string');
-        tokens.push({ kind: 'string', value: source.slice(i + 3, end) });
+        if (end === -1) throw new LexError('Unterminated block string');
+        tokens.push({ kind: 'string', value: source.slice(i + 3, end).replace(/\\"""/g, '"""') });
         i = end + 3;
         continue;
       }
       let j = i + 1;
       let out = '';
+      let closed = false;
       while (j < len) {
         const c = source[j]!;
-        if (c === '"') break;
+        if (c === '"') {
+          closed = true;
+          j += 1;
+          break;
+        }
         if (c === '\\') {
           const esc = source[j + 1];
-          if (esc === undefined) throw new ParseError('Unterminated string');
-          if (esc === 'u') {
-            const hex = source.slice(j + 2, j + 6);
-            if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new ParseError('Bad unicode escape');
-            out += String.fromCharCode(Number.parseInt(hex, 16));
-            j += 6;
-          } else {
-            const map: Record<string, string> = { '"': '"', '\\': '\\', '/': '/', n: '\n', t: '\t', r: '\r', b: '\b', f: '\f' };
-            out += map[esc] ?? esc;
-            j += 2;
+          if (esc === undefined) break;
+          switch (esc) {
+            case '"': out += '"'; break;
+            case '\\': out += '\\'; break;
+            case '/': out += '/'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'n': out += '\n'; break;
+            case 'r': out += '\r'; break;
+            case 't': out += '\t'; break;
+            case 'u': {
+              const hex = source.slice(j + 2, j + 6);
+              const code = Number.parseInt(hex, 16);
+              if (!Number.isFinite(code)) throw new LexError('Bad unicode escape in string');
+              out += String.fromCharCode(code);
+              j += 4;
+              break;
+            }
+            default:
+              throw new LexError(`Bad escape \\${esc} in string`);
           }
+          j += 2;
           continue;
         }
         out += c;
         j += 1;
       }
-      if (j >= len) throw new ParseError('Unterminated string');
+      if (!closed) throw new LexError('Unterminated string');
       tokens.push({ kind: 'string', value: out });
-      i = j + 1;
+      i = j;
       continue;
     }
-    if (ch === '-' || (ch >= '0' && ch <= '9')) {
+    if (isDigit(ch) || (ch === '-' && isDigit(source[i + 1] ?? ''))) {
       let j = i;
       if (source[j] === '-') j += 1;
-      while (j < len && source[j]! >= '0' && source[j]! <= '9') j += 1;
+      while (j < len && isDigit(source[j]!)) j += 1;
       let isFloat = false;
       if (source[j] === '.') {
         isFloat = true;
         j += 1;
-        while (j < len && source[j]! >= '0' && source[j]! <= '9') j += 1;
+        while (j < len && isDigit(source[j]!)) j += 1;
       }
       if (source[j] === 'e' || source[j] === 'E') {
         isFloat = true;
         j += 1;
         if (source[j] === '+' || source[j] === '-') j += 1;
-        while (j < len && source[j]! >= '0' && source[j]! <= '9') j += 1;
+        while (j < len && isDigit(source[j]!)) j += 1;
       }
-      const raw = source.slice(i, j);
-      tokens.push(isFloat ? { kind: 'float', value: raw } : { kind: 'int', value: raw });
+      tokens.push({ kind: isFloat ? 'float' : 'int', value: source.slice(i, j) });
       i = j;
       continue;
     }
-    if (/[A-Za-z_]/.test(ch)) {
-      let j = i;
-      while (j < len && /[A-Za-z0-9_]/.test(source[j]!)) j += 1;
+    if (isNameStart(ch)) {
+      let j = i + 1;
+      while (j < len && isNameChar(source[j]!)) j += 1;
       tokens.push({ kind: 'name', value: source.slice(i, j) });
       i = j;
       continue;
     }
-    if (source.startsWith('...', i)) {
+    if (source.slice(i, i + 3) === '...') {
       tokens.push({ kind: 'punct', value: '...' });
       i += 3;
       continue;
     }
-    if ('!$():=@[]{}|'.includes(ch)) {
+    if ('!$():=@[]{}|&'.includes(ch)) {
       tokens.push({ kind: 'punct', value: ch });
       i += 1;
       continue;
     }
-    throw new ParseError(`Unexpected character ${JSON.stringify(ch)}`);
+    throw new LexError(`Unexpected character ${JSON.stringify(ch)}`);
   }
-  tokens.push({ kind: 'eof' });
+  tokens.push({ kind: 'eof', value: '' });
   return tokens;
 }
 
-class Parser {
-  private pos = 0;
-  private readonly tokens: Token[];
+// ---------------------------------------------------------------------------
+// AST
+// ---------------------------------------------------------------------------
 
-  constructor(tokens: Token[]) {
-    this.tokens = tokens;
+type ValueNode =
+  | { kind: 'variable'; name: string }
+  | { kind: 'int'; value: number }
+  | { kind: 'float'; value: number }
+  | { kind: 'string'; value: string }
+  | { kind: 'boolean'; value: boolean }
+  | { kind: 'null' }
+  | { kind: 'enum'; value: string }
+  | { kind: 'list'; values: ValueNode[] }
+  | { kind: 'object'; fields: Array<{ name: string; value: ValueNode }> };
+
+interface FieldNode {
+  kind: 'field';
+  alias: string | null;
+  name: string;
+  args: Array<{ name: string; value: ValueNode }>;
+  selections: SelectionNode[] | null;
+}
+
+type SelectionNode =
+  | FieldNode
+  | { kind: 'fragmentSpread'; name: string }
+  | { kind: 'inlineFragment'; typeCondition: string | null; selections: SelectionNode[] };
+
+interface VariableDefinition {
+  name: string;
+  type: string;
+  defaultValue: ValueNode | null;
+}
+
+interface OperationDefinition {
+  kind: 'operation';
+  operation: 'query' | 'mutation' | 'subscription';
+  name: string | null;
+  variableDefinitions: VariableDefinition[];
+  selections: SelectionNode[];
+}
+
+interface FragmentDefinition {
+  kind: 'fragment';
+  name: string;
+  typeCondition: string;
+  selections: SelectionNode[];
+}
+
+interface Document {
+  operations: OperationDefinition[];
+  fragments: Map<string, FragmentDefinition>;
+}
+
+class ParseError extends Error {}
+
+/** A recursive-descent parser for the GraphQL document language. */
+class Parser {
+  private readonly tokens: Token[];
+  private pos = 0;
+
+  constructor(source: string) {
+    this.tokens = tokenize(source);
   }
 
   private peek(): Token {
@@ -216,74 +226,91 @@ class Parser {
   }
 
   private next(): Token {
-    const tok = this.tokens[this.pos]!;
+    const token = this.tokens[this.pos]!;
     if (this.pos < this.tokens.length - 1) this.pos += 1;
-    return tok;
+    return token;
   }
 
   private expectPunct(value: string): void {
-    const tok = this.next();
-    if (tok.kind !== 'punct' || tok.value !== value) {
-      throw new ParseError(`Expected "${value}" but got ${tok.kind === 'eof' ? 'end of input' : JSON.stringify(tok)}`);
+    const token = this.next();
+    if (token.kind !== 'punct' || token.value !== value) {
+      throw new ParseError(`Expected "${value}", got ${JSON.stringify(token.value)}`);
     }
   }
 
-  private acceptPunct(value: string): boolean {
-    const tok = this.peek();
-    if (tok.kind === 'punct' && tok.value === value) {
+  private expectName(value?: string): string {
+    const token = this.next();
+    if (token.kind !== 'name') throw new ParseError(`Expected a name, got ${JSON.stringify(token.value)}`);
+    if (value !== undefined && token.value !== value) {
+      throw new ParseError(`Expected "${value}", got ${JSON.stringify(token.value)}`);
+    }
+    return token.value;
+  }
+
+  private skipDirectives(): void {
+    while (this.peek().kind === 'punct' && this.peek().value === '@') {
       this.next();
-      return true;
+      this.expectName();
+      if (this.peek().kind === 'punct' && this.peek().value === '(') this.parseArguments();
     }
-    return false;
   }
 
-  private expectName(what = 'a name'): string {
-    const tok = this.next();
-    if (tok.kind !== 'name') throw new ParseError(`Expected ${what} but got ${tok.kind}`);
-    return tok.value;
+  parseDocument(): Document {
+    const operations: OperationDefinition[] = [];
+    const fragments = new Map<string, FragmentDefinition>();
+    while (this.peek().kind !== 'eof') {
+      const token = this.peek();
+      if (token.kind === 'punct' && token.value === '{') {
+        operations.push({
+          kind: 'operation',
+          operation: 'query',
+          name: null,
+          variableDefinitions: [],
+          selections: this.parseSelectionSet(),
+        });
+        continue;
+      }
+      if (token.kind === 'name' && (token.value === 'query' || token.value === 'mutation' || token.value === 'subscription')) {
+        operations.push(this.parseOperation());
+        continue;
+      }
+      if (token.kind === 'name' && token.value === 'fragment') {
+        const fragment = this.parseFragment();
+        fragments.set(fragment.name, fragment);
+        continue;
+      }
+      throw new ParseError(`Unexpected ${JSON.stringify(token.value)} at the top of a document`);
+    }
+    return { operations, fragments };
   }
 
-  parseDocument(): DefinitionNode[] {
-    const defs: DefinitionNode[] = [];
-    while (this.peek().kind !== 'eof') defs.push(this.parseDefinition());
-    return defs;
+  private parseOperation(): OperationDefinition {
+    const operation = this.next().value as 'query' | 'mutation' | 'subscription';
+    let name: string | null = null;
+    if (this.peek().kind === 'name') name = this.next().value;
+    let variableDefinitions: VariableDefinition[] = [];
+    if (this.peek().kind === 'punct' && this.peek().value === '(') {
+      variableDefinitions = this.parseVariableDefinitions();
+    }
+    this.skipDirectives();
+    const selections = this.parseSelectionSet();
+    return { kind: 'operation', operation, name, variableDefinitions, selections };
   }
 
-  private parseDefinition(): DefinitionNode {
-    const tok = this.peek();
-    if (tok.kind === 'punct' && tok.value === '{') {
-      return { kind: 'operation', operation: 'query', name: null, variables: [], selections: this.parseSelectionSet() };
-    }
-    if (tok.kind === 'name' && (tok.value === 'query' || tok.value === 'mutation' || tok.value === 'subscription')) {
-      const operation = this.next().value as 'query' | 'mutation' | 'subscription';
-      let name: string | null = null;
-      if (this.peek().kind === 'name') name = this.next().value;
-      const variables = this.peek().kind === 'punct' && this.peek().value === '(' ? this.parseVariableDefinitions() : [];
-      this.parseDirectives();
-      return { kind: 'operation', operation, name, variables, selections: this.parseSelectionSet() };
-    }
-    if (tok.kind === 'name' && tok.value === 'fragment') {
-      this.next();
-      const name = this.expectName('a fragment name');
-      const on = this.expectName('"on"');
-      if (on !== 'on') throw new ParseError('Expected "on" in fragment definition');
-      const typeCondition = this.expectName('a type name');
-      this.parseDirectives();
-      return { kind: 'fragment', name, typeCondition, selections: this.parseSelectionSet() };
-    }
-    throw new ParseError(`Unexpected token ${JSON.stringify(tok)} at top level`);
-  }
-
-  private parseVariableDefinitions(): VariableDef[] {
-    const out: VariableDef[] = [];
+  private parseVariableDefinitions(): VariableDefinition[] {
+    const out: VariableDefinition[] = [];
     this.expectPunct('(');
     while (!(this.peek().kind === 'punct' && this.peek().value === ')')) {
       this.expectPunct('$');
-      const name = this.expectName('a variable name');
+      const name = this.expectName();
       this.expectPunct(':');
       const type = this.parseType();
       let defaultValue: ValueNode | null = null;
-      if (this.acceptPunct('=')) defaultValue = this.parseValue(true);
+      if (this.peek().kind === 'punct' && this.peek().value === '=') {
+        this.next();
+        defaultValue = this.parseValue(true);
+      }
+      this.skipDirectives();
       out.push({ name, type, defaultValue });
     }
     this.expectPunct(')');
@@ -291,68 +318,88 @@ class Parser {
   }
 
   private parseType(): string {
-    const tok = this.peek();
-    if (tok.kind === 'punct' && tok.value === '[') {
+    const token = this.peek();
+    let base: string;
+    if (token.kind === 'punct' && token.value === '[') {
       this.next();
-      const inner = this.parseType();
-      this.expectPunct(']');
-      let type = `[${inner}]`;
-      if (this.acceptPunct('!')) type += '!';
-      return type;
+      base = `[${this.parseType()}]`;
+    } else {
+      base = this.expectName();
     }
-    const name = this.expectName('a type name');
-    let type = name;
-    if (this.acceptPunct('!')) type += '!';
-    return type;
+    if (this.peek().kind === 'punct' && this.peek().value === '!') {
+      this.next();
+      return `${base}!`;
+    }
+    return base;
+  }
+
+  private parseFragment(): FragmentDefinition {
+    this.expectName('fragment');
+    const name = this.expectName();
+    this.expectName('on');
+    const typeCondition = this.expectName();
+    this.skipDirectives();
+    const selections = this.parseSelectionSet();
+    return { kind: 'fragment', name, typeCondition, selections };
   }
 
   private parseSelectionSet(): SelectionNode[] {
-    const out: SelectionNode[] = [];
     this.expectPunct('{');
+    const selections: SelectionNode[] = [];
     while (!(this.peek().kind === 'punct' && this.peek().value === '}')) {
-      if (this.peek().kind === 'eof') throw new ParseError('Unterminated selection set');
-      out.push(this.parseSelection());
+      selections.push(this.parseSelection());
     }
     this.expectPunct('}');
-    return out;
+    return selections;
   }
 
   private parseSelection(): SelectionNode {
-    if (this.peek().kind === 'punct' && this.peek().value === '...') {
+    const token = this.peek();
+    if (token.kind === 'punct' && token.value === '...') {
       this.next();
-      const tok = this.peek();
-      if (tok.kind === 'name' && tok.value === 'on') {
-        this.next();
-        const typeCondition = this.expectName('a type name');
-        const directives = this.parseDirectives();
-        return { kind: 'inlineFragment', typeCondition, directives, selections: this.parseSelectionSet() };
-      }
-      if (tok.kind === 'name') {
+      const next = this.peek();
+      if (next.kind === 'name' && next.value !== 'on') {
         const name = this.next().value;
-        const directives = this.parseDirectives();
-        return { kind: 'fragmentSpread', name, directives };
+        this.skipDirectives();
+        return { kind: 'fragmentSpread', name };
       }
-      const directives = this.parseDirectives();
-      return { kind: 'inlineFragment', typeCondition: null, directives, selections: this.parseSelectionSet() };
+      let typeCondition: string | null = null;
+      if (next.kind === 'name' && next.value === 'on') {
+        this.next();
+        typeCondition = this.expectName();
+      }
+      this.skipDirectives();
+      return { kind: 'inlineFragment', typeCondition, selections: this.parseSelectionSet() };
     }
-    const first = this.expectName('a field name');
+    return this.parseField();
+  }
+
+  private parseField(): FieldNode {
+    const first = this.expectName();
     let alias: string | null = null;
     let name = first;
-    if (this.acceptPunct(':')) {
+    if (this.peek().kind === 'punct' && this.peek().value === ':') {
+      this.next();
       alias = first;
-      name = this.expectName('a field name');
+      name = this.expectName();
     }
-    const args = this.peek().kind === 'punct' && this.peek().value === '(' ? this.parseArguments() : [];
-    const directives = this.parseDirectives();
-    const selections = this.peek().kind === 'punct' && this.peek().value === '{' ? this.parseSelectionSet() : null;
-    return { kind: 'field', name, alias, args, directives, selections };
+    let args: Array<{ name: string; value: ValueNode }> = [];
+    if (this.peek().kind === 'punct' && this.peek().value === '(') {
+      args = this.parseArguments();
+    }
+    this.skipDirectives();
+    let selections: SelectionNode[] | null = null;
+    if (this.peek().kind === 'punct' && this.peek().value === '{') {
+      selections = this.parseSelectionSet();
+    }
+    return { kind: 'field', alias, name, args, selections };
   }
 
   private parseArguments(): Array<{ name: string; value: ValueNode }> {
     const out: Array<{ name: string; value: ValueNode }> = [];
     this.expectPunct('(');
     while (!(this.peek().kind === 'punct' && this.peek().value === ')')) {
-      const name = this.expectName('an argument name');
+      const name = this.expectName();
       this.expectPunct(':');
       out.push({ name, value: this.parseValue(false) });
     }
@@ -360,289 +407,401 @@ class Parser {
     return out;
   }
 
-  private parseDirectives(): DirectiveNode[] {
-    const out: DirectiveNode[] = [];
-    while (this.peek().kind === 'punct' && this.peek().value === '@') {
-      this.next();
-      const name = this.expectName('a directive name');
-      const args = this.peek().kind === 'punct' && this.peek().value === '(' ? this.parseArguments() : [];
-      out.push({ name, args });
-    }
-    return out;
-  }
-
   private parseValue(isConst: boolean): ValueNode {
-    const tok = this.next();
-    if (tok.kind === 'punct' && tok.value === '$') {
-      if (isConst) throw new ParseError('Variable in constant value');
-      return { kind: 'variable', name: this.expectName('a variable name') };
+    const token = this.next();
+    if (token.kind === 'punct' && token.value === '$') {
+      if (isConst) throw new ParseError('A variable is not allowed in a constant value');
+      return { kind: 'variable', name: this.expectName() };
     }
-    if (tok.kind === 'punct' && tok.value === '[') {
+    if (token.kind === 'punct' && token.value === '[') {
       const values: ValueNode[] = [];
       while (!(this.peek().kind === 'punct' && this.peek().value === ']')) {
-        if (this.peek().kind === 'eof') throw new ParseError('Unterminated list');
         values.push(this.parseValue(isConst));
       }
       this.expectPunct(']');
       return { kind: 'list', values };
     }
-    if (tok.kind === 'punct' && tok.value === '{') {
+    if (token.kind === 'punct' && token.value === '{') {
       const fields: Array<{ name: string; value: ValueNode }> = [];
       while (!(this.peek().kind === 'punct' && this.peek().value === '}')) {
-        if (this.peek().kind === 'eof') throw new ParseError('Unterminated object');
-        const name = this.expectName('an object field name');
+        const name = this.expectName();
         this.expectPunct(':');
         fields.push({ name, value: this.parseValue(isConst) });
       }
       this.expectPunct('}');
       return { kind: 'object', fields };
     }
-    if (tok.kind === 'string') return { kind: 'string', value: tok.value };
-    if (tok.kind === 'int') return { kind: 'int', value: Number.parseInt(tok.value, 10) };
-    if (tok.kind === 'float') return { kind: 'float', value: Number.parseFloat(tok.value) };
-    if (tok.kind === 'name') {
-      if (tok.value === 'true') return { kind: 'boolean', value: true };
-      if (tok.value === 'false') return { kind: 'boolean', value: false };
-      if (tok.value === 'null') return { kind: 'null' };
-      return { kind: 'enum', value: tok.value };
+    if (token.kind === 'int') return { kind: 'int', value: Number.parseInt(token.value, 10) };
+    if (token.kind === 'float') return { kind: 'float', value: Number.parseFloat(token.value) };
+    if (token.kind === 'string') return { kind: 'string', value: token.value };
+    if (token.kind === 'name') {
+      if (token.value === 'true') return { kind: 'boolean', value: true };
+      if (token.value === 'false') return { kind: 'boolean', value: false };
+      if (token.value === 'null') return { kind: 'null' };
+      return { kind: 'enum', value: token.value };
     }
-    throw new ParseError(`Unexpected value token ${JSON.stringify(tok)}`);
+    throw new ParseError(`Unexpected value ${JSON.stringify(token.value)}`);
   }
 }
 
-// ---------------------------------------------------------------------------------------------
-// schema: allowed fields per type, and introspection data
-// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// the static schema table (validation + introspection)
+// ---------------------------------------------------------------------------
 
-const FIELD_SETS: Record<string, string[]> = {
-  Query: ['viewer', 'repository', 'node', '__type', '__schema'],
-  Mutation: ['createIssue', 'closeIssue', 'createPullRequest', 'mergePullRequest', 'addComment'],
-  Viewer: ['id', 'login', 'name', 'email'],
-  User: ['id', 'login', 'name', 'email'],
-  Repository: [
-    'id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef',
-    'viewerPermission', 'hasIssuesEnabled', 'description', 'private',
-    'createdAt', 'updatedAt', 'issue', 'issues', 'pullRequest', 'pullRequests',
-  ],
-  Ref: ['name', 'prefix', 'id'],
-  Issue: ['id', 'number', 'title', 'state', 'body', 'createdAt', 'updatedAt', 'author', 'comments'],
-  IssueConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
-  IssueEdge: ['node', 'cursor'],
-  PullRequest: [
-    'id', 'number', 'title', 'body', 'state', 'merged', 'mergeable',
-    'headRefName', 'baseRefName', 'files', 'createdAt', 'updatedAt', 'author',
-  ],
-  PullRequestConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
-  PullRequestEdge: ['node', 'cursor'],
-  PullRequestFile: ['path', 'additions', 'deletions', 'changes'],
-  PullRequestFileConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
-  PullRequestFileEdge: ['node', 'cursor'],
-  PageInfo: ['hasNextPage', 'hasPreviousPage', 'endCursor', 'startCursor'],
-  IssueComment: ['id', 'body', 'createdAt', 'author'],
-  IssueCommentConnection: ['nodes', 'edges', 'pageInfo', 'totalCount'],
-  CommentEdge: ['node', 'cursor'],
-  CreateIssuePayload: ['issue', 'clientMutationId'],
-  CloseIssuePayload: ['issue', 'clientMutationId'],
-  CreatePullRequestPayload: ['pullRequest', 'clientMutationId'],
-  MergePullRequestPayload: ['pullRequest', 'clientMutationId'],
-  AddCommentPayload: ['commentEdge', 'subject', 'clientMutationId'],
-  __Type: ['name', 'kind', 'description', 'fields', 'enumValues'],
-  __Field: ['name', 'description', 'args', 'type'],
-  __InputValue: ['name', 'description', 'type', 'defaultValue'],
-  __EnumValue: ['name', 'description'],
-  __Schema: ['queryType', 'mutationType', 'subscriptionType', 'types'],
-};
+interface FieldDef {
+  /** The GraphQL type the field returns (a scalar name or an object type). */
+  type: string;
+}
 
-interface TypeInfo {
-  kind: 'OBJECT' | 'ENUM' | 'SCALAR' | 'INTERFACE';
-  fields?: string[];
+interface TypeDef {
+  kind: 'OBJECT' | 'ENUM' | 'INTERFACE' | 'INPUT_OBJECT' | 'SCALAR';
+  fields?: Record<string, FieldDef>;
   enumValues?: string[];
 }
 
-const TYPE_INFO: Record<string, TypeInfo> = {
-  Query: { kind: 'OBJECT', fields: ['viewer', 'repository', 'node', '__type', '__schema'] },
-  Mutation: { kind: 'OBJECT', fields: ['createIssue', 'closeIssue', 'createPullRequest', 'mergePullRequest', 'addComment'] },
+const SCALARS = new Set(['String', 'Int', 'Float', 'Boolean', 'ID', 'URI', 'DateTime']);
+
+const SCHEMA: Record<string, TypeDef> = {
+  Query: {
+    kind: 'OBJECT',
+    fields: {
+      viewer: { type: 'User' },
+      repository: { type: 'Repository' },
+      node: { type: 'Node' },
+      nodes: { type: 'Node' },
+      __type: { type: '__Type' },
+      __schema: { type: '__Schema' },
+    },
+  },
+  Mutation: {
+    kind: 'OBJECT',
+    fields: {
+      createIssue: { type: 'CreateIssuePayload' },
+      closeIssue: { type: 'CloseIssuePayload' },
+      createPullRequest: { type: 'CreatePullRequestPayload' },
+      mergePullRequest: { type: 'MergePullRequestPayload' },
+      addComment: { type: 'AddCommentPayload' },
+    },
+  },
+  Node: { kind: 'INTERFACE', fields: { id: { type: 'ID' } } },
+  User: {
+    kind: 'OBJECT',
+    fields: {
+      id: { type: 'ID' },
+      login: { type: 'String' },
+      name: { type: 'String' },
+      email: { type: 'String' },
+      url: { type: 'URI' },
+    },
+  },
   Repository: {
     kind: 'OBJECT',
-    fields: [
-      'id', 'databaseId', 'name', 'nameWithOwner', 'owner', 'defaultBranchRef',
-      'viewerPermission', 'hasIssuesEnabled', 'issue', 'issues', 'pullRequests', 'pullRequest',
-    ],
+    fields: {
+      id: { type: 'ID' },
+      databaseId: { type: 'Int' },
+      name: { type: 'String' },
+      nameWithOwner: { type: 'String' },
+      owner: { type: 'User' },
+      defaultBranchRef: { type: 'Ref' },
+      viewerPermission: { type: 'RepositoryPermission' },
+      hasIssuesEnabled: { type: 'Boolean' },
+      description: { type: 'String' },
+      private: { type: 'Boolean' },
+      url: { type: 'URI' },
+      createdAt: { type: 'DateTime' },
+      updatedAt: { type: 'DateTime' },
+      issue: { type: 'Issue' },
+      issues: { type: 'IssueConnection' },
+      pullRequests: { type: 'PullRequestConnection' },
+      pullRequest: { type: 'PullRequest' },
+    },
   },
-  Issue: { kind: 'OBJECT', fields: ['id', 'number', 'title', 'state', 'body'] },
+  Ref: {
+    kind: 'OBJECT',
+    fields: { name: { type: 'String' }, target: { type: 'GitObject' } },
+  },
+  GitObject: { kind: 'OBJECT', fields: { oid: { type: 'String' } } },
+  Issue: {
+    kind: 'OBJECT',
+    fields: {
+      id: { type: 'ID' },
+      number: { type: 'Int' },
+      title: { type: 'String' },
+      state: { type: 'IssueState' },
+      body: { type: 'String' },
+      createdAt: { type: 'DateTime' },
+      updatedAt: { type: 'DateTime' },
+      url: { type: 'URI' },
+      author: { type: 'User' },
+      labels: { type: 'LabelConnection' },
+      comments: { type: 'IssueCommentConnection' },
+    },
+  },
+  Label: {
+    kind: 'OBJECT',
+    fields: { id: { type: 'ID' }, name: { type: 'String' }, color: { type: 'String' }, description: { type: 'String' } },
+  },
+  LabelConnection: {
+    kind: 'OBJECT',
+    fields: { nodes: { type: 'Label' }, edges: { type: 'LabelEdge' }, pageInfo: { type: 'PageInfo' }, totalCount: { type: 'Int' } },
+  },
+  LabelEdge: { kind: 'OBJECT', fields: { node: { type: 'Label' }, cursor: { type: 'String' } } },
+  IssueConnection: {
+    kind: 'OBJECT',
+    fields: { nodes: { type: 'Issue' }, edges: { type: 'IssueEdge' }, pageInfo: { type: 'PageInfo' }, totalCount: { type: 'Int' } },
+  },
+  IssueEdge: { kind: 'OBJECT', fields: { node: { type: 'Issue' }, cursor: { type: 'String' } } },
+  IssueCommentConnection: {
+    kind: 'OBJECT',
+    fields: { nodes: { type: 'IssueComment' }, edges: { type: 'IssueCommentEdge' }, pageInfo: { type: 'PageInfo' }, totalCount: { type: 'Int' } },
+  },
+  IssueCommentEdge: { kind: 'OBJECT', fields: { node: { type: 'IssueComment' }, cursor: { type: 'String' } } },
+  IssueComment: {
+    kind: 'OBJECT',
+    fields: {
+      id: { type: 'ID' },
+      body: { type: 'String' },
+      createdAt: { type: 'DateTime' },
+      updatedAt: { type: 'DateTime' },
+      author: { type: 'User' },
+    },
+  },
   PullRequest: {
     kind: 'OBJECT',
-    fields: ['id', 'number', 'headRefName', 'baseRefName', 'mergeable', 'state', 'merged', 'files'],
+    fields: {
+      id: { type: 'ID' },
+      number: { type: 'Int' },
+      title: { type: 'String' },
+      body: { type: 'String' },
+      state: { type: 'PullRequestState' },
+      merged: { type: 'Boolean' },
+      mergedAt: { type: 'DateTime' },
+      mergeable: { type: 'MergeableState' },
+      headRefName: { type: 'String' },
+      baseRefName: { type: 'String' },
+      headRefOid: { type: 'String' },
+      baseRefOid: { type: 'String' },
+      files: { type: 'PullRequestChangedFileConnection' },
+      createdAt: { type: 'DateTime' },
+      updatedAt: { type: 'DateTime' },
+      url: { type: 'URI' },
+      author: { type: 'User' },
+    },
   },
-  User: { kind: 'OBJECT', fields: ['id', 'login', 'name', 'email'] },
-  Viewer: { kind: 'OBJECT', fields: ['id', 'login', 'name', 'email'] },
-  IssueConnection: { kind: 'OBJECT', fields: ['nodes', 'edges', 'pageInfo', 'totalCount'] },
-  PullRequestConnection: { kind: 'OBJECT', fields: ['nodes', 'edges', 'pageInfo', 'totalCount'] },
-  PageInfo: { kind: 'OBJECT', fields: ['hasNextPage', 'hasPreviousPage', 'endCursor', 'startCursor'] },
-  IssueComment: { kind: 'OBJECT', fields: ['id', 'body', 'createdAt', 'author'] },
-  Node: { kind: 'INTERFACE', fields: ['id'] },
-  SearchType: { kind: 'ENUM', enumValues: ['ISSUE', 'REPOSITORY', 'USER'] },
+  PullRequestConnection: {
+    kind: 'OBJECT',
+    fields: { nodes: { type: 'PullRequest' }, edges: { type: 'PullRequestEdge' }, pageInfo: { type: 'PageInfo' }, totalCount: { type: 'Int' } },
+  },
+  PullRequestEdge: { kind: 'OBJECT', fields: { node: { type: 'PullRequest' }, cursor: { type: 'String' } } },
+  PullRequestChangedFileConnection: {
+    kind: 'OBJECT',
+    fields: { nodes: { type: 'PullRequestChangedFile' }, edges: { type: 'PullRequestChangedFileEdge' }, pageInfo: { type: 'PageInfo' }, totalCount: { type: 'Int' } },
+  },
+  PullRequestChangedFileEdge: { kind: 'OBJECT', fields: { node: { type: 'PullRequestChangedFile' }, cursor: { type: 'String' } } },
+  PullRequestChangedFile: {
+    kind: 'OBJECT',
+    fields: {
+      path: { type: 'String' },
+      additions: { type: 'Int' },
+      deletions: { type: 'Int' },
+      changeType: { type: 'PullRequestChangeType' },
+    },
+  },
+  PageInfo: {
+    kind: 'OBJECT',
+    fields: {
+      hasNextPage: { type: 'Boolean' },
+      hasPreviousPage: { type: 'Boolean' },
+      startCursor: { type: 'String' },
+      endCursor: { type: 'String' },
+    },
+  },
+  CreateIssuePayload: {
+    kind: 'OBJECT',
+    fields: { issue: { type: 'Issue' }, clientMutationId: { type: 'String' } },
+  },
+  CloseIssuePayload: {
+    kind: 'OBJECT',
+    fields: { issue: { type: 'Issue' }, clientMutationId: { type: 'String' } },
+  },
+  CreatePullRequestPayload: {
+    kind: 'OBJECT',
+    fields: { pullRequest: { type: 'PullRequest' }, clientMutationId: { type: 'String' } },
+  },
+  MergePullRequestPayload: {
+    kind: 'OBJECT',
+    fields: { pullRequest: { type: 'PullRequest' }, clientMutationId: { type: 'String' } },
+  },
+  AddCommentPayload: {
+    kind: 'OBJECT',
+    fields: { commentEdge: { type: 'IssueCommentEdge' }, subject: { type: 'Node' }, clientMutationId: { type: 'String' } },
+  },
+  __Schema: {
+    kind: 'OBJECT',
+    fields: {
+      types: { type: '__Type' },
+      queryType: { type: '__Type' },
+      mutationType: { type: '__Type' },
+      description: { type: 'String' },
+      directives: { type: '__Directive' },
+    },
+  },
+  __Type: {
+    kind: 'OBJECT',
+    fields: {
+      name: { type: 'String' },
+      kind: { type: 'String' },
+      description: { type: 'String' },
+      fields: { type: '__Field' },
+      enumValues: { type: '__EnumValue' },
+      inputFields: { type: '__InputValue' },
+      interfaces: { type: '__Type' },
+      possibleTypes: { type: '__Type' },
+    },
+  },
+  __Field: {
+    kind: 'OBJECT',
+    fields: {
+      name: { type: 'String' },
+      description: { type: 'String' },
+      args: { type: '__InputValue' },
+      type: { type: '__Type' },
+    },
+  },
+  __InputValue: {
+    kind: 'OBJECT',
+    fields: {
+      name: { type: 'String' },
+      description: { type: 'String' },
+      type: { type: '__Type' },
+      defaultValue: { type: 'String' },
+    },
+  },
+  __EnumValue: {
+    kind: 'OBJECT',
+    fields: {
+      name: { type: 'String' },
+      description: { type: 'String' },
+      isDeprecated: { type: 'Boolean' },
+      deprecationReason: { type: 'String' },
+    },
+  },
+  __Directive: {
+    kind: 'OBJECT',
+    fields: { name: { type: 'String' }, description: { type: 'String' } },
+  },
   IssueState: { kind: 'ENUM', enumValues: ['OPEN', 'CLOSED'] },
   PullRequestState: { kind: 'ENUM', enumValues: ['OPEN', 'CLOSED', 'MERGED'] },
   MergeableState: { kind: 'ENUM', enumValues: ['MERGEABLE', 'CONFLICTING', 'UNKNOWN'] },
+  OrderDirection: { kind: 'ENUM', enumValues: ['ASC', 'DESC'] },
+  IssueOrderField: { kind: 'ENUM', enumValues: ['CREATED_AT', 'UPDATED_AT', 'COMMENTS'] },
+  PullRequestChangeType: { kind: 'ENUM', enumValues: ['ADDED', 'MODIFIED', 'REMOVED', 'RENAMED'] },
   RepositoryPermission: { kind: 'ENUM', enumValues: ['ADMIN', 'MAINTAIN', 'WRITE', 'TRIAGE', 'READ'] },
   PullRequestMergeMethod: { kind: 'ENUM', enumValues: ['MERGE', 'SQUASH', 'REBASE'] },
-  IssueOrderField: { kind: 'ENUM', enumValues: ['CREATED_AT', 'UPDATED_AT', 'COMMENTS'] },
-  OrderDirection: { kind: 'ENUM', enumValues: ['ASC', 'DESC'] },
-  String: { kind: 'SCALAR' },
-  Int: { kind: 'SCALAR' },
-  ID: { kind: 'SCALAR' },
-  Boolean: { kind: 'SCALAR' },
+  SearchType: {
+    kind: 'ENUM',
+    enumValues: ['ISSUE', 'REPOSITORY', 'USER', 'DISCUSSION', 'COMMIT', 'CODE', 'WIKI', 'MILESTONE'],
+  },
+  CreateIssueInput: { kind: 'INPUT_OBJECT' },
+  CloseIssueInput: { kind: 'INPUT_OBJECT' },
+  CreatePullRequestInput: { kind: 'INPUT_OBJECT' },
+  MergePullRequestInput: { kind: 'INPUT_OBJECT' },
+  AddCommentInput: { kind: 'INPUT_OBJECT' },
+  IssueOrder: { kind: 'INPUT_OBJECT' },
 };
 
-// ---------------------------------------------------------------------------------------------
-// views: plain objects the executor resolves fields from
-// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// validation
+// ---------------------------------------------------------------------------
 
-type View = Record<string, unknown> & { __typename: string };
-
-function userView(login: string, id: number): View {
-  return { __typename: 'User', id: String(id), login, name: login, email: `${login}@example.invalid` };
+function isObjectType(typeName: string): boolean {
+  const def = SCHEMA[typeName];
+  return def !== undefined && (def.kind === 'OBJECT' || def.kind === 'INTERFACE');
 }
 
-function viewerView(store: Store): View {
-  const viewer = store.viewer();
-  const view = userView(viewer.login, viewer.id);
-  view.__typename = 'Viewer';
-  view.name = viewer.name;
-  view.email = viewer.email;
-  return view;
-}
-
-function repoView(store: Store, repo: Repo): View {
-  return {
-    __typename: 'Repository',
-    id: store.repoId(repo),
-    databaseId: repo.id,
-    name: repo.name,
-    nameWithOwner: repo.fullName,
-    owner: userView(repo.owner, repo.owner === VIEWER_LOGIN ? store.viewer().id : 0),
-    defaultBranchRef: { __typename: 'Ref', name: repo.defaultBranch, prefix: 'refs/heads/', id: `R_${repo.owner}_${repo.name}` },
-    viewerPermission: 'ADMIN',
-    hasIssuesEnabled: true,
-    description: repo.description,
-    private: repo.private,
-    createdAt: repo.createdAt,
-    updatedAt: repo.updatedAt,
-    _repo: repo,
-  };
-}
-
-function issueState(issue: Issue): string {
-  return issue.state === 'open' ? 'OPEN' : 'CLOSED';
-}
-
-function issueView(store: Store, repo: Repo, issue: Issue): View {
-  return {
-    __typename: 'Issue',
-    id: issue.id,
-    number: issue.number,
-    title: issue.title,
-    state: issueState(issue),
-    body: issue.body,
-    createdAt: issue.createdAt,
-    updatedAt: issue.updatedAt,
-    _repo: repo,
-    _issue: issue,
-  };
-}
-
-function pullState(pr: Pull): string {
-  if (pr.state === 'open') return 'OPEN';
-  return pr.merged ? 'MERGED' : 'CLOSED';
-}
-
-function pullView(store: Store, repo: Repo, pr: Pull): View {
-  return {
-    __typename: 'PullRequest',
-    id: pr.id,
-    number: pr.number,
-    title: pr.title,
-    body: pr.body,
-    state: pullState(pr),
-    merged: pr.merged,
-    mergeable: store.prMergeable(repo, pr),
-    headRefName: pr.head.ref,
-    baseRefName: pr.base.ref,
-    createdAt: pr.createdAt,
-    updatedAt: pr.updatedAt,
-    _repo: repo,
-    _pull: pr,
-  };
-}
-
-function commentView(store: Store, repo: Repo, issue: Issue, comment: { id: number; body: string; createdAt: string }): View {
-  return {
-    __typename: 'IssueComment',
-    id: `C_${repo.owner}_${repo.name}_${issue.number}_${comment.id}`,
-    body: comment.body,
-    createdAt: comment.createdAt,
-    _repo: repo,
-    _issue: issue,
-  };
-}
-
-function typeView(name: string): View | null {
-  const info = TYPE_INFO[name];
-  if (!info) return null;
-  return {
-    __typename: '__Type',
-    name,
-    kind: info.kind,
-    description: null,
-    fields: info.fields ? info.fields.map((field) => ({ __typename: '__Field', name: field, description: null, args: [], type: null })) : null,
-    enumValues: info.enumValues ? info.enumValues.map((value) => ({ __typename: '__EnumValue', name: value, description: null })) : null,
-  };
-}
-
-// ---------------------------------------------------------------------------------------------
-// cursors (opaque, deterministic)
-// ---------------------------------------------------------------------------------------------
-
-function encodeCursor(kind: string, value: number): string {
-  return Buffer.from(`${kind}:${value}`, 'utf8').toString('base64');
-}
-
-function decodeCursor(after: unknown): number | null {
-  if (typeof after !== 'string' || after === '') return null;
-  if (/^\d+$/.test(after)) return Number.parseInt(after, 10);
-  try {
-    const text = Buffer.from(after, 'base64').toString('utf8');
-    const match = /^[^:]+:(\d+)$/.exec(text);
-    if (match) return Number.parseInt(match[1]!, 10);
-  } catch {
-    return null;
+/** Validate one operation's selections against the schema; returns the error messages. */
+function validateSelections(
+  typeName: string,
+  selections: SelectionNode[],
+  fragments: Map<string, FragmentDefinition>,
+  errors: string[],
+  depth: number,
+): void {
+  if (depth > 32) {
+    errors.push('Selection nesting is too deep');
+    return;
   }
-  return null;
+  const typeDef = SCHEMA[typeName];
+  for (const selection of selections) {
+    if (selection.kind === 'field') {
+      if (selection.name === '__typename') {
+        if (selection.selections !== null) errors.push('Field "__typename" must not have a selection set');
+        continue;
+      }
+      const field = typeDef?.fields?.[selection.name];
+      if (field === undefined) {
+        errors.push(`Cannot query field "${selection.name}" on type "${typeName}".`);
+        continue;
+      }
+      if (selection.selections !== null) {
+        if (!isObjectType(field.type)) {
+          errors.push(`Field "${selection.name}" of type "${field.type}" must not have a selection set.`);
+        } else {
+          validateSelections(field.type, selection.selections, fragments, errors, depth + 1);
+        }
+      }
+      continue;
+    }
+    if (selection.kind === 'fragmentSpread') {
+      const fragment = fragments.get(selection.name);
+      if (fragment === undefined) {
+        errors.push(`Unknown fragment "${selection.name}".`);
+        continue;
+      }
+      if (!fragmentApplies(typeName, fragment.typeCondition)) {
+        errors.push(`Fragment "${selection.name}" cannot be spread here: fragment on "${fragment.typeCondition}" never applies to "${typeName}".`);
+        continue;
+      }
+      validateSelections(fragment.typeCondition, fragment.selections, fragments, errors, depth + 1);
+      continue;
+    }
+    // Inline fragment.
+    const condition = selection.typeCondition ?? typeName;
+    if (SCHEMA[condition] === undefined) {
+      errors.push(`Unknown type "${condition}".`);
+      continue;
+    }
+    if (!fragmentApplies(typeName, condition)) {
+      errors.push(`Fragment cannot be spread here: fragment on "${condition}" never applies to "${typeName}".`);
+      continue;
+    }
+    validateSelections(condition, selection.selections, fragments, errors, depth + 1);
+  }
 }
 
-// ---------------------------------------------------------------------------------------------
-// executor
-// ---------------------------------------------------------------------------------------------
-
-class GqlError extends Error {}
-
-interface Executor {
-  store: Store;
-  variables: Record<string, unknown>;
-  fragments: Map<string, FragmentNode>;
-  errors: Array<{ message: string }>;
+/** Whether a fragment on `condition` can apply to a value of `typeName`. */
+function fragmentApplies(typeName: string, condition: string): boolean {
+  if (typeName === condition) return true;
+  if (typeName === 'Node') return true; // Node's possible types are Repository, Issue, PullRequest.
+  if (condition === 'Node') return typeName === 'Repository' || typeName === 'Issue' || typeName === 'PullRequest';
+  return false;
 }
 
-function resolveValue(node: ValueNode, variables: Record<string, unknown>): unknown {
+// ---------------------------------------------------------------------------
+// values and variables
+// ---------------------------------------------------------------------------
+
+type Variables = Record<string, unknown>;
+
+function valueFromNode(node: ValueNode, variables: Variables): unknown {
   switch (node.kind) {
     case 'variable': {
-      if (!(node.name in variables)) throw new GqlError(`Variable $${node.name} is not provided`);
-      return variables[node.name];
+      const value = variables[node.name];
+      return value === undefined ? null : value;
     }
-    case 'string':
     case 'int':
     case 'float':
+    case 'string':
     case 'boolean':
       return node.value;
     case 'null':
@@ -650,693 +809,916 @@ function resolveValue(node: ValueNode, variables: Record<string, unknown>): unkn
     case 'enum':
       return node.value;
     case 'list':
-      return node.values.map((value) => resolveValue(value, variables));
+      return node.values.map((child) => valueFromNode(child, variables));
     case 'object': {
       const out: Record<string, unknown> = {};
-      for (const field of node.fields) out[field.name] = resolveValue(field.value, variables);
+      for (const field of node.fields) out[field.name] = valueFromNode(field.value, variables);
       return out;
     }
   }
 }
 
-function argsMap(field: FieldNode, variables: Record<string, unknown>): Record<string, unknown> {
+function argumentsOf(field: FieldNode, variables: Variables): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  for (const arg of field.args) out[arg.name] = resolveValue(arg.value, variables);
+  for (const arg of field.args) out[arg.name] = valueFromNode(arg.value, variables);
   return out;
 }
 
-function typeMatches(current: string, condition: string | null): boolean {
-  if (condition === null) return true;
-  if (condition === current) return true;
-  if (condition === 'Node') return ['Repository', 'Issue', 'PullRequest', 'User', 'Viewer', 'IssueComment'].includes(current);
-  if (condition === 'Actor') return ['User', 'Viewer'].includes(current);
-  if ((current === 'Viewer' && condition === 'User') || (current === 'User' && condition === 'Viewer')) return true;
-  return false;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-/** @skip(if:true)/@include(if:false) hide a selection. */
-function directivesHide(directives: DirectiveNode[], variables: Record<string, unknown>): boolean {
-  for (const directive of directives) {
-    const ifArg = directive.args.find((arg) => arg.name === 'if');
-    if (!ifArg) continue;
-    const value = resolveValue(ifArg.value, variables);
-    if (directive.name === 'skip' && value === true) return true;
-    if (directive.name === 'include' && value === false) return true;
-  }
-  return false;
+function stringArg(args: Record<string, unknown>, name: string): string | undefined {
+  const value = args[name];
+  return typeof value === 'string' ? value : undefined;
 }
 
-function pageInfoView(hasNextPage: boolean, hasPreviousPage: boolean, startCursor: string | null, endCursor: string | null): View {
-  return { __typename: 'PageInfo', hasNextPage, hasPreviousPage, startCursor, endCursor };
+function intArg(args: Record<string, unknown>, name: string): number | undefined {
+  const value = args[name];
+  return typeof value === 'number' && Number.isInteger(value) ? value : undefined;
 }
 
-function issuesConnection(exec: Executor, repo: Repo, args: Record<string, unknown>): View {
-  const statesRaw = args.states;
-  const states: string[] | null = Array.isArray(statesRaw)
-    ? statesRaw.map((state) => String(state).toUpperCase())
-    : null;
-  let issues = [...repo.issues];
-  // GitHub's default when no states argument is given is OPEN only (the suite's
-  // pull-requests-list check calls the no-states list "the open list", and no
-  // check expects merged/closed items in a no-states list).
-  if (states) {
-    const wanted = new Set(states.map((state) => (state === 'OPEN' ? 'open' : state === 'CLOSED' ? 'closed' : state.toLowerCase())));
-    issues = issues.filter((issue) => wanted.has(issue.state));
-  } else {
-    issues = issues.filter((issue) => issue.state === 'open');
+// ---------------------------------------------------------------------------
+// cursors and connections
+// ---------------------------------------------------------------------------
+
+/** A stable, opaque cursor for one issue number. */
+function issueCursor(number: number): string {
+  return Buffer.from(`cursor:${number}`, 'utf8').toString('base64');
+}
+
+function cursorNumber(cursor: string): number | null {
+  try {
+    const text = Buffer.from(cursor, 'base64').toString('utf8');
+    const match = /^cursor:(\d+)$/.exec(text);
+    return match === null ? null : Number.parseInt(match[1], 10);
+  } catch {
+    return null;
   }
-  const orderBy = (args.orderBy ?? {}) as Record<string, unknown>;
-  const direction = String(orderBy.direction ?? 'DESC').toUpperCase();
-  const field = String(orderBy.field ?? 'CREATED_AT').toUpperCase();
-  const descending = direction !== 'ASC';
-  const compare = (a: Issue, b: Issue): number => {
-    let cmp = 0;
-    if (field === 'UPDATED_AT') cmp = a.updatedAt < b.updatedAt ? -1 : a.updatedAt > b.updatedAt ? 1 : 0;
-    else if (field === 'COMMENTS') {
-      cmp = (repo.comments.get(a.number)?.length ?? 0) - (repo.comments.get(b.number)?.length ?? 0);
-    } else cmp = a.number - b.number;
-    if (cmp === 0) cmp = a.number - b.number;
-    return descending ? -cmp : cmp;
-  };
-  issues.sort(compare);
-  const afterNum = decodeCursor(args.after);
-  if (afterNum !== null) {
-    issues = descending ? issues.filter((issue) => issue.number < afterNum) : issues.filter((issue) => issue.number > afterNum);
+}
+
+interface PageInfo {
+  hasNextPage: boolean;
+  hasPreviousPage: boolean;
+  startCursor: string | null;
+  endCursor: string | null;
+}
+
+/** Slice `nodes` after `after` and cap at `first`, with its pageInfo. */
+function pageConnection<T extends { number: number }>(
+  nodes: readonly T[],
+  first: number | undefined,
+  after: string | undefined,
+): { nodes: T[]; pageInfo: PageInfo; totalCount: number } {
+  let start = 0;
+  if (after !== undefined && after !== null) {
+    const afterNumber = cursorNumber(after);
+    if (afterNumber !== null) {
+      const index = nodes.findIndex((node) => node.number === afterNumber);
+      if (index !== -1) start = index + 1;
+    }
   }
-  const first = typeof args.first === 'number' && args.first >= 0 ? Math.floor(args.first) : issues.length;
-  const page = issues.slice(0, first);
-  const hasNextPage = issues.length > page.length;
-  const nodes = page.map((issue) => issueView(exec.store, repo, issue));
-  const edges = page.map((issue) => ({
-    __typename: 'IssueEdge',
-    node: issueView(exec.store, repo, issue),
-    cursor: encodeCursor('issue', issue.number),
-  }));
+  const rest = nodes.slice(start);
+  const page = first === undefined ? rest : rest.slice(0, first);
+  const hasNextPage = first !== undefined ? rest.length > first : false;
   return {
-    __typename: 'IssueConnection',
-    nodes,
-    edges,
-    pageInfo: pageInfoView(
+    nodes: page,
+    pageInfo: {
       hasNextPage,
-      afterNum !== null,
-      page.length ? encodeCursor('issue', page[0]!.number) : null,
-      page.length ? encodeCursor('issue', page[page.length - 1]!.number) : null,
-    ),
-    totalCount: issues.length,
+      hasPreviousPage: start > 0,
+      startCursor: page.length === 0 ? null : issueCursor(page[0]!.number),
+      endCursor: page.length === 0 ? null : issueCursor(page[page.length - 1]!.number),
+    },
+    totalCount: nodes.length,
   };
 }
 
-function pullsConnection(exec: Executor, repo: Repo, args: Record<string, unknown>): View {
-  const statesRaw = args.states;
-  const states: string[] | null = Array.isArray(statesRaw)
-    ? statesRaw.map((state) => String(state).toUpperCase())
-    : null;
-  let pulls = exec.store.listPulls(repo, 'all');
-  // GitHub's default when no states argument is given is OPEN only (see
-  // issuesConnection above).
-  if (states) {
-    pulls = pulls.filter((pr) => states.includes(pullState(pr)));
-  } else {
-    pulls = pulls.filter((pr) => pullState(pr) === 'OPEN');
+/** One connection object: its nodes, pageInfo and total count. */
+function connectionObject(typename: string, nodes: GqlObject[], pageInfo: PageInfo, totalCount: number): GqlObject {
+  return { __typename: typename, _nodes: nodes, _pageInfo: pageInfo, totalCount };
+}
+
+/** A connection holding one full page: no cursor, no next page. */
+function wholeConnection(typename: string, nodes: GqlObject[]): GqlObject {
+  return connectionObject(
+    typename,
+    nodes,
+    { hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null },
+    nodes.length,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// object builders (the values resolvers hand back)
+// ---------------------------------------------------------------------------
+
+type GqlObject = Record<string, unknown> & { __typename: string };
+
+function userObject(store: Store, login: string): GqlObject | null {
+  const user = store.getUser(login);
+  if (user === undefined) return null;
+  return {
+    __typename: 'User',
+    id: `U_${user.login}`,
+    login: user.login,
+    name: user.name,
+    email: user.email,
+    url: `https://github.com/${user.login}`,
+  };
+}
+
+function repositoryObject(store: Store, repo: Repo): GqlObject {
+  return {
+    __typename: 'Repository',
+    _repo: repo,
+    id: store.repoId(repo),
+    databaseId: repo.id,
+    name: repo.name,
+    nameWithOwner: repo.fullName,
+    viewerPermission: 'ADMIN',
+    hasIssuesEnabled: true,
+    description: repo.description,
+    private: repo.private,
+    url: `https://github.com/${repo.fullName}`,
+    createdAt: repo.createdAt,
+    updatedAt: repo.updatedAt,
+  };
+}
+
+function issueObject(repo: Repo, issue: Issue): GqlObject {
+  return {
+    __typename: 'Issue',
+    _repo: repo,
+    _issue: issue,
+    id: issue.id,
+    number: issue.number,
+    title: issue.title,
+    state: issue.state === 'open' ? 'OPEN' : 'CLOSED',
+    body: issue.body,
+    createdAt: issue.createdAt,
+    updatedAt: issue.updatedAt,
+    url: `https://github.com/${repo.fullName}/issues/${issue.number}`,
+  };
+}
+
+function pullObject(store: Store, repo: Repo, pull: Pull): GqlObject {
+  return {
+    __typename: 'PullRequest',
+    _repo: repo,
+    _pull: pull,
+    id: pull.id,
+    number: pull.number,
+    title: pull.title,
+    body: pull.body,
+    state: pull.state === 'open' ? 'OPEN' : 'CLOSED',
+    merged: pull.merged,
+    mergedAt: pull.mergedAt,
+    headRefName: pull.head.ref,
+    baseRefName: pull.base.ref,
+    headRefOid: pull.head.sha,
+    baseRefOid: pull.base.sha,
+    createdAt: pull.createdAt,
+    updatedAt: pull.updatedAt,
+    url: `https://github.com/${repo.fullName}/pull/${pull.number}`,
+  };
+}
+
+function commentObject(repo: Repo, issueNumber: number, id: number, body: string, createdAt: string): GqlObject {
+  return {
+    __typename: 'IssueComment',
+    id: `IC_${repo.owner}_${repo.name}_${issueNumber}_${id}`,
+    body,
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
+function typeObject(name: string): GqlObject | null {
+  const def = SCHEMA[name];
+  if (def === undefined) return null;
+  return {
+    __typename: '__Type',
+    _typeName: name,
+    name,
+    kind: def.kind,
+    description: null,
+  };
+}
+
+function fieldObject(typeName: string, fieldName: string): GqlObject {
+  return {
+    __typename: '__Field',
+    _typeName: typeName,
+    _fieldName: fieldName,
+    name: fieldName,
+    description: null,
+  };
+}
+
+function enumValueObject(name: string): GqlObject {
+  return { __typename: '__EnumValue', name, description: null, isDeprecated: false, deprecationReason: null };
+}
+
+// ---------------------------------------------------------------------------
+// execution
+// ---------------------------------------------------------------------------
+
+class GraphQLError extends Error {
+  readonly path: Array<string | number> | undefined;
+
+  constructor(message: string, path?: Array<string | number>) {
+    super(message);
+    this.name = 'GraphQLError';
+    this.path = path;
   }
-  const orderBy = (args.orderBy ?? {}) as Record<string, unknown>;
-  const descending = String(orderBy.direction ?? 'DESC').toUpperCase() !== 'ASC';
-  pulls.sort((a, b) => (descending ? b.number - a.number : a.number - b.number));
-  const afterNum = decodeCursor(args.after);
-  if (afterNum !== null) {
-    pulls = descending ? pulls.filter((pr) => pr.number < afterNum) : pulls.filter((pr) => pr.number > afterNum);
-  }
-  const first = typeof args.first === 'number' && args.first >= 0 ? Math.floor(args.first) : pulls.length;
-  const page = pulls.slice(0, first);
-  const hasNextPage = pulls.length > page.length;
-  const nodes = page.map((pr) => pullView(exec.store, repo, pr));
-  const edges = page.map((pr) => ({
-    __typename: 'PullRequestEdge',
-    node: pullView(exec.store, repo, pr),
-    cursor: encodeCursor('pull', pr.number),
-  }));
-  return {
-    __typename: 'PullRequestConnection',
-    nodes,
-    edges,
-    pageInfo: pageInfoView(
-      hasNextPage,
-      afterNum !== null,
-      page.length ? encodeCursor('pull', page[0]!.number) : null,
-      page.length ? encodeCursor('pull', page[page.length - 1]!.number) : null,
-    ),
-    totalCount: pulls.length,
-  };
-}
-
-function filesConnection(exec: Executor, repo: Repo, pr: Pull, args: Record<string, unknown>): View {
-  const refreshed = exec.store.getPull(repo, pr.number) ?? pr;
-  const files = refreshed.files.map((file, index) => ({
-    __typename: 'PullRequestFile',
-    path: file.filename,
-    additions: file.additions,
-    deletions: file.deletions,
-    changes: file.changes,
-    _index: index,
-  }));
-  const afterIdx = decodeCursor(args.after);
-  const rest = afterIdx === null ? files : files.filter((file) => (file._index as number) > afterIdx);
-  const first = typeof args.first === 'number' && args.first >= 0 ? Math.floor(args.first) : rest.length;
-  const page = rest.slice(0, first);
-  const hasNextPage = rest.length > page.length;
-  const nodes = page.map((file) => ({ __typename: 'PullRequestFile', path: file.path, additions: file.additions, deletions: file.deletions, changes: file.changes }));
-  const edges = page.map((file) => ({
-    __typename: 'PullRequestFileEdge',
-    node: { __typename: 'PullRequestFile', path: file.path, additions: file.additions, deletions: file.deletions, changes: file.changes },
-    cursor: encodeCursor('file', file._index as number),
-  }));
-  return {
-    __typename: 'PullRequestFileConnection',
-    nodes,
-    edges,
-    pageInfo: pageInfoView(
-      hasNextPage,
-      afterIdx !== null,
-      page.length ? encodeCursor('file', page[0]!._index as number) : null,
-      page.length ? encodeCursor('file', page[page.length - 1]!._index as number) : null,
-    ),
-    totalCount: files.length,
-  };
-}
-
-function commentsConnection(exec: Executor, repo: Repo, issue: Issue, args: Record<string, unknown>): View {
-  const comments = exec.store.listComments(repo, issue.number);
-  const first = typeof args.first === 'number' && args.first >= 0 ? Math.floor(args.first) : comments.length;
-  const page = comments.slice(0, first);
-  const nodes = page.map((comment) => commentView(exec.store, repo, issue, comment));
-  return {
-    __typename: 'IssueCommentConnection',
-    nodes,
-    edges: page.map((comment) => ({
-      __typename: 'CommentEdge',
-      node: commentView(exec.store, repo, issue, comment),
-      cursor: encodeCursor('comment', comment.id),
-    })),
-    pageInfo: pageInfoView(comments.length > page.length, false, null, null),
-    totalCount: comments.length,
-  };
 }
 
 /**
- * Resolve one field on a view. Returns the raw value plus the child type name
- * (null for scalars / null values). Throws GqlError for bad arguments or
- * failed mutations; the caller turns it into an `errors` entry.
+ * Execute one operation document. Returns the `{data, errors?}` envelope
+ * (errors omitted when empty).
  */
-function resolveField(exec: Executor, typeName: string, view: View, field: FieldNode): { value: unknown; childType: string | null } {
-  const store = exec.store;
-  const args = argsMap(field, exec.variables);
-  const repo = view._repo as Repo | undefined;
+function executeDocument(
+  store: Store,
+  query: string,
+  variables: Variables,
+  operationName: string | undefined,
+): Record<string, unknown> {
+  let document: Document;
+  try {
+    document = new Parser(query).parseDocument();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { data: null, errors: [{ message: `Syntax Error: ${message}` }] };
+  }
+  if (document.operations.length === 0) {
+    return { data: null, errors: [{ message: 'The document holds no operation.' }] };
+  }
+  let operation: OperationDefinition | undefined;
+  if (operationName !== undefined) {
+    operation = document.operations.find((candidate) => candidate.name === operationName);
+    if (operation === undefined) {
+      return { data: null, errors: [{ message: `Unknown operation named "${operationName}".` }] };
+    }
+  } else if (document.operations.length === 1) {
+    operation = document.operations[0]!;
+  } else {
+    return {
+      data: null,
+      errors: [{ message: 'Must provide operation name when there are multiple operations.' }],
+    };
+  }
 
-  switch (typeName) {
-    case 'Query': {
-      if (field.name === 'viewer') return { value: viewerView(store), childType: 'Viewer' };
-      if (field.name === 'repository') {
-        const owner = args.owner;
-        const name = args.name;
-        if (typeof owner !== 'string' || typeof name !== 'string') {
-          throw new GqlError('Field "repository" requires string arguments "owner" and "name"');
-        }
-        const found = store.getRepo(owner, name);
-        return { value: found ? repoView(store, found) : null, childType: 'Repository' };
-      }
-      if (field.name === 'node') {
-        const id = args.id;
-        if (typeof id !== 'string') throw new GqlError('Field "node" requires a string argument "id"');
-        const asRepo = store.findRepoById(id);
-        if (asRepo) return { value: repoView(store, asRepo), childType: 'Repository' };
-        const asIssue = store.findIssueById(id);
-        if (asIssue) return { value: issueView(store, asIssue.repo, asIssue.issue), childType: 'Issue' };
-        const asPull = store.findPullById(id);
-        if (asPull) return { value: pullView(store, asPull.repo, asPull.pull), childType: 'PullRequest' };
-        return { value: null, childType: null };
-      }
-      if (field.name === '__type') {
-        const name = args.name;
-        if (typeof name !== 'string') throw new GqlError('Field "__type" requires a string argument "name"');
-        const info = typeView(name);
-        return { value: info, childType: '__Type' };
-      }
-      if (field.name === '__schema') {
-        const types = Object.keys(TYPE_INFO).map((name) => typeView(name)).filter((entry): entry is View => entry !== null);
-        return {
-          value: {
-            __typename: '__Schema',
-            queryType: typeView('Query'),
-            mutationType: typeView('Mutation'),
-            subscriptionType: null,
-            types,
-          },
-          childType: '__Schema',
-        };
-      }
-      break;
-    }
-    case 'Mutation': {
-      if (field.name === 'createIssue') {
-        const input = (args.input ?? {}) as Record<string, unknown>;
-        const repositoryId = input.repositoryId;
-        if (typeof repositoryId !== 'string') throw new GqlError('createIssue requires input.repositoryId');
-        const target = store.findRepoById(repositoryId);
-        if (!target) throw new GqlError(`Repository not found: ${repositoryId}`);
-        if (typeof input.title !== 'string' || input.title === '') throw new GqlError('createIssue requires input.title');
-        try {
-          const issue = store.createIssue(target, { title: input.title, body: typeof input.body === 'string' ? input.body : undefined });
-          return {
-            value: { __typename: 'CreateIssuePayload', issue: issueView(store, target, issue), clientMutationId: input.clientMutationId ?? null },
-            childType: 'CreateIssuePayload',
-          };
-        } catch (err) {
-          if (isStoreError(err)) throw new GqlError(err.message);
-          throw err;
-        }
-      }
-      if (field.name === 'closeIssue') {
-        const input = (args.input ?? {}) as Record<string, unknown>;
-        const issueId = input.issueId;
-        if (typeof issueId !== 'string') throw new GqlError('closeIssue requires input.issueId');
-        const found = store.findIssueById(issueId);
-        if (!found) throw new GqlError(`Issue not found: ${issueId}`);
-        const issue = store.closeIssue(found.repo, found.issue.number);
-        return {
-          value: { __typename: 'CloseIssuePayload', issue: issueView(store, found.repo, issue), clientMutationId: input.clientMutationId ?? null },
-          childType: 'CloseIssuePayload',
-        };
-      }
-      if (field.name === 'createPullRequest') {
-        const input = (args.input ?? {}) as Record<string, unknown>;
-        const repositoryId = input.repositoryId;
-        if (typeof repositoryId !== 'string') throw new GqlError('createPullRequest requires input.repositoryId');
-        const target = store.findRepoById(repositoryId);
-        if (!target) throw new GqlError(`Repository not found: ${repositoryId}`);
-        const head = input.headRefName;
-        const base = input.baseRefName;
-        if (typeof head !== 'string' || typeof base !== 'string') throw new GqlError('createPullRequest requires input.headRefName and input.baseRefName');
-        if (typeof input.title !== 'string' || input.title === '') throw new GqlError('createPullRequest requires input.title');
-        try {
-          const pr = store.createPull(target, {
-            title: input.title,
-            body: typeof input.body === 'string' ? input.body : undefined,
-            head,
-            base,
-          });
-          return {
-            value: { __typename: 'CreatePullRequestPayload', pullRequest: pullView(store, target, pr), clientMutationId: input.clientMutationId ?? null },
-            childType: 'CreatePullRequestPayload',
-          };
-        } catch (err) {
-          if (isStoreError(err)) throw new GqlError(err.message);
-          throw err;
-        }
-      }
-      if (field.name === 'mergePullRequest') {
-        const input = (args.input ?? {}) as Record<string, unknown>;
-        const pullRequestId = input.pullRequestId;
-        if (typeof pullRequestId !== 'string') throw new GqlError('mergePullRequest requires input.pullRequestId');
-        const found = store.findPullById(pullRequestId);
-        if (!found) throw new GqlError(`Pull request not found: ${pullRequestId}`);
-        try {
-          store.mergePullSquash(found.repo, found.pull.number);
-        } catch (err) {
-          if (isStoreError(err)) throw new GqlError(err.message);
-          throw err;
-        }
-        const merged = store.getPull(found.repo, found.pull.number) ?? found.pull;
-        return {
-          value: { __typename: 'MergePullRequestPayload', pullRequest: pullView(store, found.repo, merged), clientMutationId: input.clientMutationId ?? null },
-          childType: 'MergePullRequestPayload',
-        };
-      }
-      if (field.name === 'addComment') {
-        const input = (args.input ?? {}) as Record<string, unknown>;
-        const subjectId = input.subjectId;
-        if (typeof subjectId !== 'string') throw new GqlError('addComment requires input.subjectId');
-        const found = store.findIssueById(subjectId);
-        if (!found) throw new GqlError(`Issue not found: ${subjectId}`);
-        if (typeof input.body !== 'string' || input.body === '') throw new GqlError('addComment requires input.body');
-        const comment = store.addComment(found.repo, found.issue.number, input.body);
-        const node = commentView(store, found.repo, found.issue, comment);
-        return {
-          value: {
-            __typename: 'AddCommentPayload',
-            commentEdge: { __typename: 'CommentEdge', node, cursor: encodeCursor('comment', comment.id) },
-            subject: issueView(store, found.repo, found.issue),
-            clientMutationId: input.clientMutationId ?? null,
-          },
-          childType: 'AddCommentPayload',
-        };
-      }
-      break;
-    }
-    case 'Repository': {
-      if (!repo) throw new GqlError('Repository view has no repo');
-      switch (field.name) {
-        case 'issue': {
-          const number = args.number;
-          if (typeof number !== 'number') throw new GqlError('Field "issue" requires an integer argument "number"');
-          const issue = store.getIssue(repo, number);
-          return { value: issue ? issueView(store, repo, issue) : null, childType: 'Issue' };
-        }
-        case 'issues':
-          return { value: issuesConnection(exec, repo, args), childType: 'IssueConnection' };
-        case 'pullRequest': {
-          const number = args.number;
-          if (typeof number !== 'number') throw new GqlError('Field "pullRequest" requires an integer argument "number"');
-          const pr = store.getPull(repo, number);
-          return { value: pr ? pullView(store, repo, pr) : null, childType: 'PullRequest' };
-        }
-        case 'pullRequests':
-          return { value: pullsConnection(exec, repo, args), childType: 'PullRequestConnection' };
-        default:
-          return { value: view[field.name] ?? null, childType: field.name === 'owner' ? 'User' : field.name === 'defaultBranchRef' ? 'Ref' : null };
-      }
-    }
-    case 'Issue': {
-      const issue = view._issue as Issue | undefined;
-      if (!repo || !issue) throw new GqlError('Issue view has no issue');
-      if (field.name === 'author') return { value: viewerView(store), childType: 'Viewer' };
-      if (field.name === 'comments') return { value: commentsConnection(exec, repo, issue, args), childType: 'IssueCommentConnection' };
-      return { value: view[field.name] ?? null, childType: null };
-    }
-    case 'PullRequest': {
-      const pr = view._pull as Pull | undefined;
-      if (!repo || !pr) throw new GqlError('Pull request view has no pull request');
-      if (field.name === 'author') return { value: viewerView(store), childType: 'Viewer' };
-      if (field.name === 'files') return { value: filesConnection(exec, repo, pr, args), childType: 'PullRequestFileConnection' };
-      if (field.name === 'mergeable') return { value: store.prMergeable(repo, store.getPull(repo, pr.number) ?? pr), childType: null };
-      if (field.name === 'state') return { value: pullState(store.getPull(repo, pr.number) ?? pr), childType: null };
-      if (field.name === 'merged') return { value: (store.getPull(repo, pr.number) ?? pr).merged, childType: null };
-      return { value: view[field.name] ?? null, childType: null };
-    }
-    case 'IssueConnection':
-    case 'PullRequestConnection':
-    case 'PullRequestFileConnection':
-    case 'IssueCommentConnection': {
-      if (field.name === 'totalCount') return { value: view.totalCount ?? null, childType: null };
-      return { value: view[field.name] ?? null, childType: null };
-    }
-    case 'IssueEdge':
-    case 'PullRequestEdge':
-    case 'PullRequestFileEdge':
-    case 'CommentEdge': {
-      return { value: view[field.name] ?? null, childType: field.name === 'node' ? edgeNodeType(typeName) : null };
-    }
-    case '__Type': {
-      return { value: view[field.name] ?? null, childType: field.name === 'fields' ? '__Field' : field.name === 'enumValues' ? '__EnumValue' : null };
-    }
-    case '__Schema': {
-      if (field.name === 'queryType' || field.name === 'mutationType') return { value: view[field.name] ?? null, childType: '__Type' };
-      return { value: view[field.name] ?? null, childType: field.name === 'types' ? '__Type' : null };
-    }
-    default: {
-      return { value: view[field.name] ?? null, childType: null };
+  // Bind the variables, applying defaults from the definitions.
+  const bound: Variables = { ...variables };
+  for (const def of operation.variableDefinitions) {
+    if (bound[def.name] === undefined && def.defaultValue !== null) {
+      bound[def.name] = valueFromNode(def.defaultValue, {});
     }
   }
-  // Field is in FIELD_SETS for this type but has no resolver above: treat as scalar on the view.
-  return { value: view[field.name] ?? null, childType: null };
-}
 
-function edgeNodeType(edgeType: string): string {
-  switch (edgeType) {
-    case 'IssueEdge':
-      return 'Issue';
-    case 'PullRequestEdge':
-      return 'PullRequest';
-    case 'PullRequestFileEdge':
-      return 'PullRequestFile';
-    case 'CommentEdge':
-      return 'IssueComment';
-    default:
-      return 'Issue';
+  // Validate the whole operation before executing any of it.
+  const errors: string[] = [];
+  const rootType = operation.operation === 'mutation' ? 'Mutation' : 'Query';
+  validateSelections(rootType, operation.selections, document.fragments, errors, 0);
+  if (errors.length > 0) {
+    return { data: null, errors: errors.map((message) => ({ message })) };
   }
-}
 
-/** Child type for an object-valued field, used when the resolver did not name one. */
-function inferChildType(typeName: string, fieldName: string): string | null {
-  switch (fieldName) {
-    case 'issue':
-      return 'Issue';
-    case 'pullRequest':
-      return 'PullRequest';
-    case 'commentEdge':
-      return 'CommentEdge';
-    case 'subject':
-      return 'Issue';
-    case 'owner':
-      return 'User';
-    case 'defaultBranchRef':
-      return 'Ref';
-    case 'author':
-      return 'Viewer';
-    case 'node':
-      return edgeNodeType(typeName);
-    case 'nodes':
-      if (typeName === 'IssueConnection') return 'Issue';
-      if (typeName === 'PullRequestConnection') return 'PullRequest';
-      if (typeName === 'PullRequestFileConnection') return 'PullRequestFile';
-      if (typeName === 'IssueCommentConnection') return 'IssueComment';
-      return null;
-    case 'edges':
-      if (typeName === 'IssueConnection') return 'IssueEdge';
-      if (typeName === 'PullRequestConnection') return 'PullRequestEdge';
-      if (typeName === 'PullRequestFileConnection') return 'PullRequestFileEdge';
-      if (typeName === 'IssueCommentConnection') return 'CommentEdge';
-      return null;
-    case 'pageInfo':
-      return 'PageInfo';
-    case 'comments':
-      return 'IssueCommentConnection';
-    case 'files':
-      return 'PullRequestFileConnection';
-    case 'issues':
-      return 'IssueConnection';
-    case 'pullRequests':
-      return 'PullRequestConnection';
-    case 'fields':
-      return '__Field';
-    case 'enumValues':
-      return '__EnumValue';
-    case 'types':
-    case 'queryType':
-    case 'mutationType':
-      return '__Type';
-    default:
-      return null;
-  }
-}
-
-/** Deep-strip internal single-`_`-prefixed keys (e.g. `_repo`) from an executed result. */
-function sanitize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map((item) => sanitize(item));
-  if (value !== null && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      // Single-underscore internals only: `__type` / `__schema` / `__typename` are real GraphQL keys.
-      if (key.startsWith('_') && !key.startsWith('__')) continue;
-      out[key] = sanitize(entry);
-    }
-    return out;
-  }
-  return value;
-}
-
-function executeSelections(exec: Executor, typeName: string, view: View | null, selections: SelectionNode[]): Record<string, unknown> | null {
-  if (view === null) return null;
-  const out: Record<string, unknown> = {};
-  for (const selection of selections) {
-    if (selection.kind === 'fragmentSpread') {
-      const fragment = exec.fragments.get(selection.name);
-      if (!fragment) {
-        exec.errors.push({ message: `Unknown fragment "${selection.name}"` });
-        continue;
-      }
-      if (directivesHide(selection.directives, exec.variables)) continue;
-      if (!typeMatches(typeName, fragment.typeCondition)) continue;
-      const nested = executeSelections(exec, typeName, view, fragment.selections);
-      if (nested) Object.assign(out, nested);
-      continue;
-    }
-    if (selection.kind === 'inlineFragment') {
-      if (directivesHide(selection.directives, exec.variables)) continue;
-      if (!typeMatches(typeName, selection.typeCondition)) continue;
-      const nested = executeSelections(exec, typeName, view, selection.selections);
-      if (nested) Object.assign(out, nested);
-      continue;
-    }
-    const field = selection;
-    if (directivesHide(field.directives, exec.variables)) continue;
-    const responseKey = field.alias ?? field.name;
-    if (field.name === '__typename') {
-      out[responseKey] = typeName;
-      continue;
-    }
-    const allowed = FIELD_SETS[typeName] ?? [];
-    if (!allowed.includes(field.name)) {
-      if (typeName === 'Viewer') {
-        exec.errors.push({ message: `noSuchFieldOnViewer: Field "${field.name}" doesn't exist on type "Viewer"` });
-      } else {
-        exec.errors.push({ message: `Field "${field.name}" doesn't exist on type "${typeName}"` });
-      }
-      out[responseKey] = null;
-      continue;
-    }
+  const data: Record<string, unknown> = {};
+  const gqlErrors: Array<Record<string, unknown>> = [];
+  for (const selection of operation.selections) {
     try {
-      const { value, childType } = resolveField(exec, typeName, view, field);
-      const resolvedChildType = childType ?? inferChildType(typeName, field.name);
-      if (value === null || value === undefined) {
-        out[responseKey] = null;
-        continue;
-      }
-      if (field.selections && resolvedChildType) {
-        if (Array.isArray(value)) {
-          out[responseKey] = value.map((item) => {
-            if (item !== null && typeof item === 'object' && '__typename' in (item as Record<string, unknown>)) {
-              return executeSelections(exec, (item as View).__typename as string, item as View, field.selections!);
-            }
-            return item;
-          });
-        } else if (typeof value === 'object' && '__typename' in (value as Record<string, unknown>)) {
-          out[responseKey] = executeSelections(exec, (value as View).__typename as string, value as View, field.selections);
-        } else {
-          out[responseKey] = value;
-        }
-      } else {
-        out[responseKey] = value;
+      const value = executeSelection(rootType, null, selection, document.fragments, store, bound, []);
+      if (selection.kind === 'field') {
+        data[selection.alias ?? selection.name] = value;
+      } else if (isRecord(value)) {
+        Object.assign(data, value);
       }
     } catch (err) {
-      if (err instanceof GqlError) {
-        exec.errors.push({ message: err.message });
-        out[responseKey] = null;
+      if (err instanceof GraphQLError) {
+        gqlErrors.push({ message: err.message, path: err.path });
+        if (selection.kind === 'field') data[selection.alias ?? selection.name] = null;
       } else {
         throw err;
       }
     }
   }
+  const out: Record<string, unknown> = { data };
+  if (gqlErrors.length > 0) out.errors = gqlErrors;
   return out;
 }
 
-function executeDocument(store: Store, doc: unknown): Record<string, unknown> {
-  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-    return { data: null, errors: [{ message: 'Request body must be a JSON object with a "query" string' }] };
+/**
+ * Execute one selection against a parent value of `typeName`. A field
+ * returns its (sub-selected) value; a fragment returns a partial data
+ * object merged by the caller.
+ */
+function executeSelection(
+  typeName: string,
+  parent: GqlObject | null,
+  selection: SelectionNode,
+  fragments: Map<string, FragmentDefinition>,
+  store: Store,
+  variables: Variables,
+  path: Array<string | number>,
+): unknown {
+  if (selection.kind === 'fragmentSpread') {
+    const fragment = fragments.get(selection.name);
+    if (fragment === undefined) return {};
+    if (!fragmentApplies(typeName, fragment.typeCondition)) return {};
+    return executeSelectionSet(fragment.typeCondition, parent, fragment.selections, fragments, store, variables, path);
   }
-  const body = doc as Record<string, unknown>;
-  const query = body.query;
-  if (typeof query !== 'string' || query.trim() === '') {
-    return { data: null, errors: [{ message: 'No query provided' }] };
+  if (selection.kind === 'inlineFragment') {
+    const condition = selection.typeCondition ?? typeName;
+    if (!fragmentApplies(typeName, condition)) return {};
+    return executeSelectionSet(condition, parent, selection.selections, fragments, store, variables, path);
   }
-  let variables: Record<string, unknown> = {};
-  if (body.variables !== undefined && body.variables !== null) {
-    if (typeof body.variables === 'string') {
-      try {
-        const parsed: unknown = JSON.parse(body.variables);
-        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) variables = parsed as Record<string, unknown>;
-      } catch {
-        return { data: null, errors: [{ message: 'Variables are not valid JSON' }] };
-      }
-    } else if (typeof body.variables === 'object' && !Array.isArray(body.variables)) {
-      variables = body.variables as Record<string, unknown>;
-    }
+  // A field.
+  const key = selection.alias ?? selection.name;
+  const fieldPath = [...path, key];
+  const value = resolveField(typeName, parent, selection, store, variables, fieldPath);
+  if (selection.selections === null || value === null || value === undefined) return value ?? null;
+  if (Array.isArray(value)) {
+    const itemType = fieldReturnType(typeName, selection.name);
+    return value.map((item, index) =>
+      executeSelectionSet(itemType, item as GqlObject, selection.selections!, fragments, store, variables, [...fieldPath, index]),
+    );
   }
-  const operationName = typeof body.operationName === 'string' ? body.operationName : null;
-
-  let definitions: DefinitionNode[];
-  try {
-    definitions = new Parser(tokenize(query)).parseDocument();
-  } catch (err) {
-    return { data: null, errors: [{ message: err instanceof Error ? err.message : 'Failed to parse query' }] };
+  if (isRecord(value)) {
+    const itemType = (value as GqlObject).__typename ?? fieldReturnType(typeName, selection.name);
+    return executeSelectionSet(itemType, value as GqlObject, selection.selections, fragments, store, variables, fieldPath);
   }
-
-  const fragments = new Map<string, FragmentNode>();
-  const operations: OperationNode[] = [];
-  for (const def of definitions) {
-    if (def.kind === 'fragment') fragments.set(def.name, def);
-    else operations.push(def);
-  }
-  if (operations.length === 0) {
-    return { data: null, errors: [{ message: 'No operation found in query' }] };
-  }
-  let operation: OperationNode | undefined;
-  if (operationName) {
-    operation = operations.find((op) => op.name === operationName);
-    if (!operation) return { data: null, errors: [{ message: `Unknown operation named "${operationName}"` }] };
-  } else if (operations.length === 1) {
-    operation = operations[0]!;
-  } else {
-    return { data: null, errors: [{ message: 'Multiple operations provided without an operationName' }] };
-  }
-
-  const exec: Executor = { store, variables: { ...variables }, fragments, errors: [] };
-  // Operation variable defaults fill in missing variables.
-  for (const def of operation.variables) {
-    if (!(def.name in exec.variables) && def.defaultValue) {
-      try {
-        exec.variables[def.name] = resolveValue(def.defaultValue, exec.variables);
-      } catch {
-        // Leave unset; use sites report it.
-      }
-    }
-  }
-  // Required variables (non-null type, no default) must be present.
-  for (const def of operation.variables) {
-    if (def.type.endsWith('!') && def.defaultValue === null && !(def.name in exec.variables)) {
-      return { data: null, errors: [{ message: `Variable $${def.name} of required type ${def.type} was not provided` }] };
-    }
-  }
-
-  const rootType = operation.operation === 'mutation' ? 'Mutation' : 'Query';
-  const rootView: View = { __typename: rootType };
-  let data: Record<string, unknown> | null;
-  try {
-    data = executeSelections(exec, rootType, rootView, operation.selections);
-  } catch (err) {
-    return { data: null, errors: [{ message: err instanceof Error ? err.message : 'Execution failed' }] };
-  }
-  data = (sanitize(data) as Record<string, unknown> | null);
-  if (exec.errors.length > 0) return { data, errors: exec.errors };
-  return { data };
+  return value;
 }
 
-// ---------------------------------------------------------------------------------------------
-// handler
-// ---------------------------------------------------------------------------------------------
+function executeSelectionSet(
+  typeName: string,
+  parent: GqlObject | null,
+  selections: SelectionNode[],
+  fragments: Map<string, FragmentDefinition>,
+  store: Store,
+  variables: Variables,
+  path: Array<string | number>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const selection of selections) {
+    if (selection.kind === 'field') {
+      out[selection.alias ?? selection.name] = executeSelection(typeName, parent, selection, fragments, store, variables, path);
+    } else {
+      const partial = executeSelection(typeName, parent, selection, fragments, store, variables, path);
+      if (isRecord(partial)) Object.assign(out, partial);
+    }
+  }
+  return out;
+}
+
+function fieldReturnType(typeName: string, fieldName: string): string {
+  return SCHEMA[typeName]?.fields?.[fieldName]?.type ?? 'String';
+}
+
+/** Resolve one field's raw value (before its sub-selections run). */
+function resolveField(
+  typeName: string,
+  parent: GqlObject | null,
+  field: FieldNode,
+  store: Store,
+  variables: Variables,
+  path: Array<string | number>,
+): unknown {
+  if (field.name === '__typename') return typeName;
+  const args = argumentsOf(field, variables);
+  switch (typeName) {
+    case 'Query':
+      return resolveQueryField(parent, field, args, store, path);
+    case 'Mutation':
+      return resolveMutationField(field, args, store, path);
+    case 'Repository':
+      return resolveRepositoryField(parent, field, args, store, path);
+    case 'Issue':
+      return resolveIssueField(parent, field, store);
+    case 'PullRequest':
+      return resolvePullRequestField(parent, field, args, store);
+    case 'IssueConnection':
+    case 'PullRequestConnection':
+    case 'PullRequestChangedFileConnection':
+    case 'LabelConnection':
+    case 'IssueCommentConnection':
+      return resolveConnectionField(parent, field);
+    case 'IssueEdge':
+    case 'PullRequestEdge':
+    case 'PullRequestChangedFileEdge':
+    case 'LabelEdge':
+    case 'IssueCommentEdge':
+      return resolveEdgeField(parent, field);
+    case '__Type':
+      return resolveTypeField(parent, field);
+    case '__Field':
+      return resolveFieldField(parent, field);
+    case '__Schema':
+      return resolveSchemaField(field);
+    default: {
+      if (parent !== null && field.name in parent) return parent[field.name] ?? null;
+      return null;
+    }
+  }
+}
+
+function resolveQueryField(
+  _parent: GqlObject | null,
+  field: FieldNode,
+  args: Record<string, unknown>,
+  store: Store,
+  path: Array<string | number>,
+): unknown {
+  switch (field.name) {
+    case 'viewer':
+      return userObject(store, store.viewer().login);
+    case 'repository': {
+      const owner = stringArg(args, 'owner');
+      const name = stringArg(args, 'name');
+      if (owner === undefined || name === undefined) return null;
+      const repo = store.getRepo(owner, name);
+      return repo === undefined ? null : repositoryObject(store, repo);
+    }
+    case 'node': {
+      const id = stringArg(args, 'id');
+      if (id === undefined) return null;
+      return nodeObject(store, id);
+    }
+    case '__type': {
+      const name = stringArg(args, 'name');
+      if (name === undefined) return null;
+      return typeObject(name);
+    }
+    case '__schema':
+      return { __typename: '__Schema', description: null };
+    default:
+      throw new GraphQLError(`Cannot query field "${field.name}" on type "Query".`, path);
+  }
+}
+
+/** Resolve a Relay `node(id:)` id to its object, or null. */
+function nodeObject(store: Store, id: string): GqlObject | null {
+  if (id.startsWith('R_')) {
+    const repo = store.findRepoById(id);
+    return repo === null ? null : repositoryObject(store, repo);
+  }
+  if (id.startsWith('PR_')) {
+    const found = store.findPullById(id);
+    return found === null ? null : pullObject(store, found.repo, found.pull);
+  }
+  if (id.startsWith('I_')) {
+    const found = store.findIssueById(id);
+    return found === null ? null : issueObject(found.repo, found.issue);
+  }
+  return null;
+}
+
+function resolveMutationField(
+  field: FieldNode,
+  args: Record<string, unknown>,
+  store: Store,
+  path: Array<string | number>,
+): unknown {
+  const input = isRecord(args.input) ? args.input : {};
+  switch (field.name) {
+    case 'createIssue': {
+      const repositoryId = stringArg(input, 'repositoryId');
+      const title = stringArg(input, 'title');
+      if (repositoryId === undefined || title === undefined) {
+        throw new GraphQLError('createIssue needs input.repositoryId and input.title.', path);
+      }
+      const repo = store.findRepoById(repositoryId);
+      if (repo === null) throw new GraphQLError('Repository not found.', path);
+      const issue = store.createIssue(repo, { title, body: stringArg(input, 'body') });
+      return { __typename: 'CreateIssuePayload', issue: issueObject(repo, issue), clientMutationId: stringArg(input, 'clientMutationId') ?? null };
+    }
+    case 'closeIssue': {
+      const issueId = stringArg(input, 'issueId');
+      if (issueId === undefined) throw new GraphQLError('closeIssue needs input.issueId.', path);
+      const found = store.findIssueById(issueId);
+      if (found === null) throw new GraphQLError('Issue not found.', path);
+      const closed = store.setIssueState(found.repo, found.issue.number, 'closed');
+      return { __typename: 'CloseIssuePayload', issue: issueObject(found.repo, closed), clientMutationId: stringArg(input, 'clientMutationId') ?? null };
+    }
+    case 'createPullRequest': {
+      const repositoryId = stringArg(input, 'repositoryId');
+      const headRefName = stringArg(input, 'headRefName');
+      const baseRefName = stringArg(input, 'baseRefName');
+      const title = stringArg(input, 'title');
+      if (repositoryId === undefined || headRefName === undefined || baseRefName === undefined || title === undefined) {
+        throw new GraphQLError('createPullRequest needs input.repositoryId, headRefName, baseRefName and title.', path);
+      }
+      const repo = store.findRepoById(repositoryId);
+      if (repo === null) throw new GraphQLError('Repository not found.', path);
+      try {
+        const pull = store.createPull(repo, { title, body: stringArg(input, 'body'), head: headRefName, base: baseRefName });
+        return { __typename: 'CreatePullRequestPayload', pullRequest: pullObject(store, repo, pull), clientMutationId: stringArg(input, 'clientMutationId') ?? null };
+      } catch (err) {
+        if (isStoreError(err)) throw new GraphQLError(err.message, path);
+        throw err;
+      }
+    }
+    case 'mergePullRequest': {
+      const pullRequestId = stringArg(input, 'pullRequestId');
+      if (pullRequestId === undefined) throw new GraphQLError('mergePullRequest needs input.pullRequestId.', path);
+      const found = store.findPullById(pullRequestId);
+      if (found === null) throw new GraphQLError('Pull request not found.', path);
+      try {
+        store.mergePullSquash(found.repo, found.pull.number);
+      } catch (err) {
+        if (isStoreError(err)) throw new GraphQLError(err.message, path);
+        throw err;
+      }
+      const merged = store.getPull(found.repo, found.pull.number)!;
+      return { __typename: 'MergePullRequestPayload', pullRequest: pullObject(store, found.repo, merged), clientMutationId: stringArg(input, 'clientMutationId') ?? null };
+    }
+    case 'addComment': {
+      const subjectId = stringArg(input, 'subjectId');
+      const body = stringArg(input, 'body');
+      if (subjectId === undefined || body === undefined) {
+        throw new GraphQLError('addComment needs input.subjectId and input.body.', path);
+      }
+      const found = store.findIssueById(subjectId);
+      if (found === null) throw new GraphQLError('Issue not found.', path);
+      const comment = store.addComment(found.repo, found.issue.number, body);
+      const node = commentObject(found.repo, found.issue.number, comment.id, comment.body, comment.createdAt);
+      return {
+        __typename: 'AddCommentPayload',
+        commentEdge: { __typename: 'IssueCommentEdge', node, cursor: null },
+        subject: issueObject(found.repo, found.issue),
+        clientMutationId: stringArg(input, 'clientMutationId') ?? null,
+      };
+    }
+    default:
+      throw new GraphQLError(`Cannot query field "${field.name}" on type "Mutation".`, path);
+  }
+}
+
+function resolveRepositoryField(
+  parent: GqlObject | null,
+  field: FieldNode,
+  args: Record<string, unknown>,
+  store: Store,
+  path: Array<string | number>,
+): unknown {
+  const repo = (parent?._repo ?? null) as Repo | null;
+  if (repo === null) return null;
+  switch (field.name) {
+    case 'owner':
+      return userObject(store, repo.owner);
+    case 'defaultBranchRef': {
+      const tip = store.branchTip(repo, repo.defaultBranch);
+      if (tip === undefined) return null;
+      return { __typename: 'Ref', name: repo.defaultBranch, target: { __typename: 'GitObject', oid: tip } };
+    }
+    case 'issue': {
+      const number = intArg(args, 'number');
+      if (number === undefined) return null;
+      const issue = store.getIssue(repo, number);
+      return issue === undefined ? null : issueObject(repo, issue);
+    }
+    case 'issues':
+      return issuesConnection(store, repo, args);
+    case 'pullRequests':
+      return pullsConnection(store, repo, args);
+    case 'pullRequest': {
+      const number = intArg(args, 'number');
+      if (number === undefined) return null;
+      const pull = store.getPull(repo, number);
+      return pull === undefined ? null : pullObject(store, repo, store.refreshPullFiles(repo, pull));
+    }
+    default:
+      if (field.name in parent) return parent[field.name] ?? null;
+      throw new GraphQLError(`Cannot query field "${field.name}" on type "Repository".`, path);
+  }
+}
+
+/** The issues connection: OPEN only unless `states` says otherwise. */
+function issuesConnection(store: Store, repo: Repo, args: Record<string, unknown>): GqlObject {
+  const statesArg = Array.isArray(args.states) ? args.states : undefined;
+  const wanted: Set<string> = statesArg === undefined
+    ? new Set(['OPEN'])
+    : new Set(statesArg.filter((entry): entry is string => typeof entry === 'string'));
+  let issues = store.listIssues(repo, 'all').filter((issue) =>
+    wanted.has(issue.state === 'open' ? 'OPEN' : 'CLOSED'),
+  );
+  const orderBy = isRecord(args.orderBy) ? args.orderBy : {};
+  const orderField = stringArg(orderBy, 'field') ?? 'CREATED_AT';
+  const direction = stringArg(orderBy, 'direction') ?? 'DESC';
+  const sign = direction === 'ASC' ? 1 : -1;
+  issues = [...issues].sort((a, b) => {
+    let by = 0;
+    if (orderField === 'UPDATED_AT') by = a.updatedAt < b.updatedAt ? -1 : a.updatedAt > b.updatedAt ? 1 : 0;
+    else if (orderField === 'COMMENTS') by = store.listComments(repo, a.number).length - store.listComments(repo, b.number).length;
+    else by = a.createdSeq - b.createdSeq;
+    if (by === 0) by = a.number - b.number;
+    return by * sign;
+  });
+  const first = intArg(args, 'first');
+  const after = stringArg(args, 'after');
+  const page = pageConnection(issues, first, after);
+  return connectionObject(
+    'IssueConnection',
+    page.nodes.map((issue) => issueObject(repo, issue)),
+    page.pageInfo,
+    page.totalCount,
+  );
+}
+
+/** The pull-requests connection: OPEN only unless `states` says otherwise. */
+function pullsConnection(store: Store, repo: Repo, args: Record<string, unknown>): GqlObject {
+  const statesArg = Array.isArray(args.states) ? args.states : undefined;
+  const wanted: Set<string> = statesArg === undefined
+    ? new Set(['OPEN'])
+    : new Set(statesArg.filter((entry): entry is string => typeof entry === 'string'));
+  let pulls = store.listPulls(repo, 'all').filter((pull) =>
+    wanted.has(pull.state === 'open' ? 'OPEN' : 'CLOSED'),
+  );
+  pulls = [...pulls].sort((a, b) => b.createdSeq - a.createdSeq || b.number - a.number);
+  const first = intArg(args, 'first');
+  const after = stringArg(args, 'after');
+  const page = pageConnection(pulls, first, after);
+  return connectionObject(
+    'PullRequestConnection',
+    page.nodes.map((pull) => pullObject(store, repo, store.refreshPullFiles(repo, pull))),
+    page.pageInfo,
+    page.totalCount,
+  );
+}
+
+function resolveIssueField(parent: GqlObject | null, field: FieldNode, store: Store): unknown {
+  const repo = (parent?._repo ?? null) as Repo | null;
+  const issue = (parent?._issue ?? null) as Issue | null;
+  if (repo === null || issue === null) return null;
+  switch (field.name) {
+    case 'author':
+      return userObject(store, repo.owner);
+    case 'labels': {
+      const nodes = issue.labels.map((label) => ({
+        __typename: 'Label',
+        id: `L_${repo.owner}_${repo.name}_${label.name}`,
+        name: label.name,
+        color: label.color,
+        description: label.description,
+      }));
+      return wholeConnection('LabelConnection', nodes);
+    }
+    case 'comments': {
+      const comments = store.listComments(repo, issue.number);
+      const nodes = comments.map((comment) => commentObject(repo, issue.number, comment.id, comment.body, comment.createdAt));
+      return wholeConnection('IssueCommentConnection', nodes);
+    }
+    default:
+      if (field.name in parent) return parent[field.name] ?? null;
+      return null;
+  }
+}
+
+function resolvePullRequestField(
+  parent: GqlObject | null,
+  field: FieldNode,
+  args: Record<string, unknown>,
+  store: Store,
+): unknown {
+  const repo = (parent?._repo ?? null) as Repo | null;
+  const pull = (parent?._pull ?? null) as Pull | null;
+  if (repo === null || pull === null) return null;
+  switch (field.name) {
+    case 'author':
+      return userObject(store, repo.owner);
+    case 'mergeable':
+      return store.prMergeable(repo, pull);
+    case 'files': {
+      const refreshed = store.refreshPullFiles(repo, pull);
+      const first = intArg(args, 'first');
+      const nodes = refreshed.files.map((file) => ({
+        __typename: 'PullRequestChangedFile',
+        path: file.filename,
+        additions: file.additions,
+        deletions: file.deletions,
+        changeType: file.status === 'added' ? 'ADDED' : file.status === 'removed' ? 'REMOVED' : 'MODIFIED',
+      }));
+      const page = first === undefined ? nodes : nodes.slice(0, first);
+      return connectionObject(
+        'PullRequestChangedFileConnection',
+        page,
+        {
+          hasNextPage: first !== undefined && nodes.length > first,
+          hasPreviousPage: false,
+          startCursor: null,
+          endCursor: null,
+        },
+        nodes.length,
+      );
+    }
+    default:
+      if (field.name in parent) return parent[field.name] ?? null;
+      return null;
+  }
+}
+
+function resolveConnectionField(parent: GqlObject | null, field: FieldNode): unknown {
+  if (parent === null) return null;
+  switch (field.name) {
+    case 'nodes':
+      return parent._nodes ?? [];
+    case 'edges': {
+      const nodes = (parent._nodes ?? []) as GqlObject[];
+      return nodes.map((node) => ({ __typename: edgeTypeFor(parent.__typename), node, cursor: null }));
+    }
+    case 'pageInfo': {
+      const info = (parent._pageInfo ?? null) as PageInfo | null;
+      if (info === null) return { __typename: 'PageInfo', hasNextPage: false, hasPreviousPage: false, startCursor: null, endCursor: null };
+      return { __typename: 'PageInfo', ...info };
+    }
+    case 'totalCount':
+      return parent.totalCount ?? ((parent._nodes as unknown[])?.length ?? 0);
+    default:
+      return null;
+  }
+}
+
+function edgeTypeFor(connectionType: string): string {
+  switch (connectionType) {
+    case 'IssueConnection': return 'IssueEdge';
+    case 'PullRequestConnection': return 'PullRequestEdge';
+    case 'PullRequestChangedFileConnection': return 'PullRequestChangedFileEdge';
+    case 'LabelConnection': return 'LabelEdge';
+    case 'IssueCommentConnection': return 'IssueCommentEdge';
+    default: return 'IssueEdge';
+  }
+}
+
+function resolveEdgeField(parent: GqlObject | null, field: FieldNode): unknown {
+  if (parent === null) return null;
+  if (field.name === 'node') return parent.node ?? null;
+  if (field.name === 'cursor') return parent.cursor ?? null;
+  return null;
+}
+
+function resolveTypeField(parent: GqlObject | null, field: FieldNode): unknown {
+  const typeName = (parent?._typeName ?? null) as string | null;
+  if (typeName === null) return null;
+  const def = SCHEMA[typeName];
+  if (def === undefined) return null;
+  switch (field.name) {
+    case 'fields': {
+      if (def.fields === undefined) return null;
+      return Object.keys(def.fields)
+        .sort()
+        .map((fieldName) => fieldObject(typeName, fieldName));
+    }
+    case 'enumValues': {
+      if (def.enumValues === undefined) return null;
+      return def.enumValues.map((name) => enumValueObject(name));
+    }
+    case 'inputFields':
+      return null;
+    case 'interfaces':
+      return [];
+    case 'possibleTypes':
+      return [];
+    default:
+      if (field.name in parent) return parent[field.name] ?? null;
+      return null;
+  }
+}
+
+function resolveFieldField(parent: GqlObject | null, field: FieldNode): unknown {
+  if (parent === null) return null;
+  switch (field.name) {
+    case 'args':
+      return [];
+    case 'type': {
+      const typeName = (parent._typeName ?? null) as string | null;
+      const fieldName = (parent._fieldName ?? null) as string | null;
+      if (typeName === null || fieldName === null) return null;
+      const returnType = SCHEMA[typeName]?.fields?.[fieldName]?.type ?? 'String';
+      return typeObject(returnType);
+    }
+    default:
+      if (field.name in parent) return parent[field.name] ?? null;
+      return null;
+  }
+}
+
+function resolveSchemaField(field: FieldNode): unknown {
+  switch (field.name) {
+    case 'queryType':
+      return typeObject('Query');
+    case 'mutationType':
+      return typeObject('Mutation');
+    case 'types':
+      return Object.keys(SCHEMA)
+        .sort()
+        .map((name) => typeObject(name))
+        .filter((entry): entry is GqlObject => entry !== null);
+    case 'directives':
+      return [];
+    default:
+      return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// the HTTP handler
+// ---------------------------------------------------------------------------
+
+const MAX_BODY_BYTES = 1 << 20;
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let failed = false;
+    req.on('data', (chunk: Buffer | string) => {
+      if (failed) return;
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += buffer.length;
+      if (total > MAX_BODY_BYTES) {
+        failed = true;
+        reject(new Error('request body too large'));
+        return;
+      }
+      chunks.push(buffer);
+    });
+    req.on('end', () => {
+      if (!failed) resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', (err: Error) => {
+      if (!failed) {
+        failed = true;
+        reject(err);
+      }
+    });
+  });
+}
+
+function sendJson(res: ServerResponse, status: number, value: unknown): void {
+  const body = JSON.stringify(value);
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'x-github-request-id': nextRequestId(),
+    'content-length': String(Buffer.byteLength(body, 'utf8')),
+  });
+  res.end(body);
+}
 
 /**
- * Handle POST /api/graphql. Returns true when the request was ours (and has
- * been answered), false otherwise so the caller falls through.
+ * Answer one GraphQL request. Returns true when the path is
+ * POST /api/graphql (and the request has been answered, including error
+ * answers), false otherwise so the caller falls through to its own 404.
  */
-export async function handleGraphql(req: IncomingMessage, res: ServerResponse, store: Store): Promise<boolean> {
-  let url: URL;
+export async function handleGraphql(
+  req: IncomingMessage,
+  res: ServerResponse,
+  store: Store,
+): Promise<boolean> {
+  const path = (req.url ?? '/').split('?')[0] ?? '/';
+  if (path !== '/api/graphql') return false;
+  if ((req.method ?? 'GET').toUpperCase() !== 'POST') return false;
   try {
-    url = new URL(req.url ?? '/', 'http://entry');
+    if (!isAuthorized(req)) {
+      sendJson(res, 401, { message: 'Requires authentication' });
+      return true;
+    }
+    let text: string;
+    try {
+      text = await readBody(req);
+    } catch {
+      sendJson(res, 400, { errors: [{ message: 'Could not read request body' }] });
+      return true;
+    }
+    let body: unknown;
+    try {
+      body = JSON.parse(text) as unknown;
+    } catch {
+      sendJson(res, 400, { errors: [{ message: 'Request body is not valid JSON' }] });
+      return true;
+    }
+    if (Array.isArray(body)) {
+      // GitHub-style operation batching: one result per document, in order.
+      const results = body.map((entry) => {
+        if (!isRecord(entry) || typeof entry.query !== 'string') {
+          return { data: null, errors: [{ message: 'Each batched operation needs a query string.' }] };
+        }
+        const variables = isRecord(entry.variables) ? (entry.variables as Variables) : {};
+        const operationName = typeof entry.operationName === 'string' ? entry.operationName : undefined;
+        return executeDocument(store, entry.query, variables, operationName);
+      });
+      sendJson(res, 200, results);
+      return true;
+    }
+    if (!isRecord(body) || typeof body.query !== 'string') {
+      sendJson(res, 200, { data: null, errors: [{ message: 'The request body needs a query string.' }] });
+      return true;
+    }
+    const variables = isRecord(body.variables) ? (body.variables as Variables) : {};
+    const operationName = typeof body.operationName === 'string' ? body.operationName : undefined;
+    sendJson(res, 200, executeDocument(store, body.query, variables, operationName));
   } catch {
-    return false;
+    sendJson(res, 500, { errors: [{ message: 'Internal Server Error' }] });
   }
-  if ((req.method ?? 'GET') !== 'POST') return false;
-  if (url.pathname !== '/api/graphql' && url.pathname !== '/api/graphql/') return false;
-
-  if (!checkAuth(req)) {
-    sendJson(res, 401, { message: 'Requires authentication' });
-    return true;
-  }
-
-  const text = await readBody(req);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    sendJson(res, 400, { errors: [{ message: 'Request body is not valid JSON' }] });
-    return true;
-  }
-
-  if (Array.isArray(parsed)) {
-    const results = parsed.map((doc) => executeDocument(store, doc));
-    sendJson(res, 200, results);
-    return true;
-  }
-  sendJson(res, 200, executeDocument(store, parsed));
   return true;
 }
