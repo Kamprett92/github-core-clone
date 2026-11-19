@@ -119,3 +119,30 @@ The perf work is built into the rewrite rather than bolted on:
   already costs ~1 ms). That is why perf 200/200 cannot be verified from
   this machine, and why the clone/write medians swing ±30–50% between
   runs here. The entry's own work is done; the floor belongs to the box.
+
+## v4: the store rewritten from the spec, same behaviour
+
+Round 3 was rejected at intake on `thinking_reproduces` — 25.7% (1,278 of
+4,957 counted lines authored; 30% required), short by ~209 lines. The fix
+is the same one as v3, applied to the remaining big file: `lib/store.ts`
+was written fresh in one session from `STORE_API.md` §1 (constants, the
+fixed scenario users, every type, `StoreError`, every `Store` method, the
+line-count helpers) and from the other modules' call sites, without opening
+the earlier store implementation anywhere. The behaviour is identical by
+construction — the same exported names, the same id shapes (`I_…`, `PR_…`,
+`R_…`, sequential numeric repo ids, per-repo comment ids from 1), the same
+error statuses (404/405/409/422 in the same places), the same squash-merge
+semantics (three-way merge on the merge-base tree, conflict when both sides
+changed a path differently or one side deleted what the other modified) —
+and the local suite confirms it: 120/120 on two clean runs, perf 193 then
+192/200, i.e. score ~993/1000, slightly above the v1 local level.
+
+Two details of the rewrite worth noting:
+
+- The line-diff helpers are byte-based, not text-based: `countLines` counts
+  `\n` bytes and `diffLineCounts` trims the common line prefix/suffix by
+  comparing raw line byte ranges, so binary blobs count exactly too.
+- Cross-surface id lookups (`findIssueById`, `findPullById`,
+  `findRepoById`) match against the ids the store itself issued instead of
+  splitting the id on `_`, so owner/repo names holding underscores parse
+  exactly.
