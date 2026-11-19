@@ -1,5 +1,9 @@
 # github-core-clone
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/Kamprett92/github-core-clone/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/Kamprett92/github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A standalone, GitHub-compatible git forge in one Node 22 process, standard
 library only. No UI, no outside service, no proxy, no git binary: the
 suite is its only client.
@@ -88,3 +92,7 @@ clone ~0.4 s, read ~3.4–3.8 s, write ~0.36–0.41 s), score 889–892:
 the box's per-request HTTP floor is ~2 ms even for a bare `/healthz`,
 so the perf column here is floor-bound, not code-bound (the v1 entry
 measured 191/200 on the same suite on a quieter day).
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=t1yg6scf&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
