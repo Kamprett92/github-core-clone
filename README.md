@@ -87,11 +87,17 @@ emitted in fixed order.
 The kit's sealed local suite (`sdk/run.ts --perf`) against a fresh server:
 **120/120 checks on two clean runs** — git 30/30, repos 15/15, issues
 15/15, pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15 — feature
-600, agent 200. Perf on this VM measured 89–92/200 (push ~1.2 s,
-clone ~0.4 s, read ~3.4–3.8 s, write ~0.36–0.41 s), score 889–892:
-the box's per-request HTTP floor is ~2 ms even for a bare `/healthz`,
-so the perf column here is floor-bound, not code-bound (the v1 entry
-measured 191/200 on the same suite on a quieter day).
+600, agent 200. Perf on this VM measured 180–184/200 on those runs
+(push ~0.31–0.43 s, clone ~0.10–0.11 s, read ~0.90–1.03 s,
+write ~0.09–0.11 s), score 980–984. The local perf number moves with
+the box: the same suite on a loaded day measured 89–92/200 (score
+889–892), and the platform graded the v5 entry at 947 — the round-trip
+floor of the machine underneath dominates the column, not the code.
+The v6 changes are small, targeted CPU savings in the hot paths
+(readPack skips the delta machinery for delta-free packs, a received
+pack's objects are stored by their already-computed ids, the token and
+the viewer are read once, not per request), measured in isolation
+rather than in the noisy suite totals.
 
 ---
 
