@@ -40,10 +40,18 @@ export function nextRequestId(): string {
   return requestCounter.toString(16).padStart(8, '0');
 }
 
-/** The bearer token the suite presents, when one is configured. */
+/**
+ * The bearer token the suite presents, when one is configured. Read once at
+ * module load: the process starts with the variable already set and it never
+ * changes, so isAuthorized must not pay a process.env lookup per request.
+ */
+const CONFIGURED_TOKEN: string | undefined =
+  process.env.MAKEFUN_SHOP_TOKEN === undefined || process.env.MAKEFUN_SHOP_TOKEN === ''
+    ? undefined
+    : process.env.MAKEFUN_SHOP_TOKEN;
+
 export function configuredToken(): string | undefined {
-  const token = process.env.MAKEFUN_SHOP_TOKEN;
-  return token === undefined || token === '' ? undefined : token;
+  return CONFIGURED_TOKEN;
 }
 
 /** Whether this request carries the configured bearer token. */
@@ -104,7 +112,12 @@ function readBody(req: IncomingMessage): Promise<string> {
       chunks.push(buffer);
     });
     req.on('end', () => {
-      if (!failed) resolve(Buffer.concat(chunks).toString('utf8'));
+      if (!failed) {
+        // One chunk is the common case for the small JSON bodies the suite
+        // sends: answer from it directly instead of copying through concat.
+        if (chunks.length === 1) resolve(chunks[0]!.toString('utf8'));
+        else resolve(Buffer.concat(chunks).toString('utf8'));
+      }
     });
     req.on('error', (err: Error) => {
       if (!failed) {
@@ -309,6 +322,9 @@ function routeSegments(pathname: string): string[] {
     .split('/')
     .filter((piece) => piece !== '')
     .map((piece) => {
+      // decodeURIComponent is the identity on a segment with no escape, so
+      // skip the call (and its try/catch) for the common plain segment.
+      if (!piece.includes('%')) return piece;
       try {
         return decodeURIComponent(piece);
       } catch {

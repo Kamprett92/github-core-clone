@@ -728,6 +728,34 @@ export function readPack(
   }
 
   const typeNames: Record<number, GitObjectType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
+
+  // Fast path: no entry is a delta, so every entry resolves to itself and
+  // the delta machinery (offset index, resolve memo, cycle set) is skipped.
+  // The objects and entries built here are identical to the general path's.
+  const hasDelta = raw.some((entry) => entry.type === PACK_DELTA_OFS || entry.type === PACK_DELTA_REF);
+  if (!hasDelta) {
+    const entries: PackEntry[] = [];
+    const objects = new Map<string, GitObject>();
+    for (let index = 0; index < raw.length; index++) {
+      const entry = raw[index]!;
+      if (typeof entry.type !== 'number' || typeNames[entry.type] === undefined) {
+        throw new Error(`pack entry at ${entry.offset} has bad type code ${entry.type}`);
+      }
+      const object: GitObject = { type: typeNames[entry.type], data: entry.data };
+      entries.push({
+        offset: entry.offset,
+        type: object.type,
+        size: entry.size,
+        data: entry.data,
+        baseOffset: entry.baseOffset,
+        baseOid: entry.baseOid,
+        resolved: object,
+      });
+      objects.set(hashObject(object.type, object.data), object);
+    }
+    return { entries, objects };
+  }
+
   const byOffset = new Map<number, number>();
   raw.forEach((entry, index) => byOffset.set(entry.offset, index));
 

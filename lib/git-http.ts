@@ -68,11 +68,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-/** True when the request passes the git auth rule. */
+/** True when the request passes the git auth rule. The token is read once at
+ * module load: the process starts with it already set and it never changes,
+ * so this must not pay a process.env lookup per request. */
+const CONFIGURED_TOKEN: string | undefined = process.env.MAKEFUN_SHOP_TOKEN;
 function authorized(req: IncomingMessage): boolean {
-  const configured = process.env.MAKEFUN_SHOP_TOKEN;
-  if (configured === undefined || configured === '') return true;
-  return req.headers.authorization === `Bearer ${configured}`;
+  if (CONFIGURED_TOKEN === undefined || CONFIGURED_TOKEN === '') return true;
+  return req.headers.authorization === `Bearer ${CONFIGURED_TOKEN}`;
 }
 
 /** The parts of a git URL: /<owner>/<repo>.git/<rest>. Null when the path is not a git path at all. */
@@ -176,12 +178,12 @@ async function handleInfoRefs(
   store: Store,
   owner: string,
   repoName: string,
+  url: URL,
 ): Promise<boolean> {
   if (!authorized(req)) {
     sendJson(res, 401, { error: { code: 'unauthorized', message: 'Missing or invalid token' } });
     return true;
   }
-  const url = new URL(req.url ?? '/', 'http://entry');
   const service = url.searchParams.get('service');
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
     sendJson(res, 404, { error: { code: 'not_found', message: 'Unknown git service' } });
@@ -346,7 +348,6 @@ function fetchV2Answer(packets: ReadonlyArray<PktLinePacket>, store: Store, repo
     shallowBoundaries: args.shallow,
     depth: args.depth,
   });
-  const pack = writePack(plan.objects);
   if (args.haves.size > 0 && !args.done) {
     const lines =
       plan.acks.length > 0
@@ -354,6 +355,9 @@ function fetchV2Answer(packets: ReadonlyArray<PktLinePacket>, store: Store, repo
         : ['NAK\n'];
     return encodePktLines(['acknowledgments\n', ...lines, 'flush']);
   }
+  // The pack is built only when it is actually sent: a negotiation round
+  // (haves without done) answers with acknowledgments alone.
+  const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
     parts.push(
@@ -397,7 +401,6 @@ function fetchV0Answer(packets: ReadonlyArray<PktLinePacket>, store: Store, repo
     shallowBoundaries: args.shallow,
     depth: args.depth,
   });
-  const pack = writePack(plan.objects);
   const parts: Buffer[] = [];
   if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
     parts.push(
@@ -424,6 +427,9 @@ function fetchV0Answer(packets: ReadonlyArray<PktLinePacket>, store: Store, repo
     }
     return Buffer.concat(parts);
   }
+  // The pack is built only when it is actually sent: a negotiation round
+  // (haves without done) answers with acknowledgments alone.
+  const pack = writePack(plan.objects);
   if (plan.acks.length > 0) {
     parts.push(encodePktLines(plan.acks.map((oid) => `ACK ${oid}\n`)));
   } else {
@@ -547,7 +553,9 @@ async function handleReceivePack(
     const packBytes = body.subarray(consumed);
     if (packBytes.length > 0) {
       const read = readPack(packBytes, { resolveBase: store.objectLookup(repo) });
-      if (read.objects.size > 0) store.putObjects(repo, read.objects.values());
+      // readPack already hashed every entry, so store by those ids instead
+      // of paying the SHA-1 a second time in putObjects.
+      if (read.objects.size > 0) store.putObjectsById(repo, read.objects);
     }
     const lookup = store.objectLookup(repo);
     const results: string[] = [];
@@ -624,7 +632,7 @@ export async function handleGit(
   if (parsed === null) return false;
   const { owner, repo, rest } = parsed;
   try {
-    if (rest === 'info/refs') return await handleInfoRefs(req, res, store, owner, repo);
+    if (rest === 'info/refs') return await handleInfoRefs(req, res, store, owner, repo, url);
     if (rest === 'git-upload-pack') return await handleUploadPack(req, res, store, owner, repo);
     if (rest === 'git-receive-pack') return await handleReceivePack(req, res, store, owner, repo);
     sendJson(res, 404, { error: { code: 'not_found', message: 'Unknown git endpoint' } });

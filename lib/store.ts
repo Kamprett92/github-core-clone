@@ -319,9 +319,15 @@ export class Store {
     return this.users.find((user) => user.login === login);
   }
 
-  /** The viewer (adaiversen); falls back to the first scenario user. */
+  /** The viewer (adaiversen); falls back to the first scenario user. The
+   * scenario list is frozen and the viewer login is constant, so this is
+   * computed once: resolveRepo calls it on every REST request. */
+  private cachedViewer: User | undefined;
   viewer(): User {
-    return this.getUser(VIEWER_LOGIN) ?? this.users[0]!;
+    if (this.cachedViewer === undefined) {
+      this.cachedViewer = this.getUser(VIEWER_LOGIN) ?? this.users[0]!;
+    }
+    return this.cachedViewer;
   }
 
   // ---------------------------------------------------------------------------
@@ -431,6 +437,18 @@ export class Store {
     const ids: string[] = [];
     for (const object of objects) ids.push(this.putObject(repo, object.type, object.data));
     return ids;
+  }
+
+  /**
+   * Stores many at once when the ids are already known (a pack just read:
+   * readPack hashed every entry, so hashing them again here would pay the
+   * SHA-1 twice). Idempotent like putObject: an oid already present is left
+   * alone. The objects map is keyed by the id each value hashes to.
+   */
+  putObjectsById(repo: Repo, objects: ReadonlyMap<string, GitObject>): void {
+    for (const [oid, object] of objects) {
+      if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+    }
   }
 
   // ---------------------------------------------------------------------------
